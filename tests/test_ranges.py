@@ -11,6 +11,7 @@ from poker_ai.ranges import (
     WeightedRange,
     bayes_update,
     canonical_combo,
+    QUANTIZATION_SCALE,
 )
 
 
@@ -39,6 +40,9 @@ def test_weighted_range_normalizes_and_combines_reversed_combo() -> None:
     assert len(hand_range) == 2
     assert hand_range.weights[canonical_combo(("As", "Kd"))] == pytest.approx(0.75)
     assert hand_range.weights[canonical_combo(("Qc", "Qd"))] == pytest.approx(0.25)
+    assert hand_range.masses[canonical_combo(("As", "Kd"))] == 750_000_000_000_000
+    assert hand_range.masses[canonical_combo(("Qc", "Qd"))] == 250_000_000_000_000
+    assert hand_range.total_mass == QUANTIZATION_SCALE
 
 
 def test_weighted_sampling_respects_dead_cards_and_seed() -> None:
@@ -51,6 +55,34 @@ def test_weighted_sampling_respects_dead_cards_and_seed() -> None:
 
     assert first == second
     assert set(first) == {canonical_combo(("Qc", "Qd"))}
+
+
+def test_quantization_keeps_integer_mass_without_float_renormalization() -> None:
+    hand_range = WeightedRange({("As", "Kd"): 1, ("Qc", "Qd"): 1, ("2c", "3c"): 1})
+    assert set(hand_range.masses.values()) == {333_333_333_333_333}
+    assert hand_range.total_mass == 999_999_999_999_999
+    restored = WeightedRange.from_masses(hand_range.masses)
+    assert restored.masses == hand_range.masses
+    assert restored.total_mass == hand_range.total_mass
+
+
+def test_sampling_uses_integer_interval_and_cumulative_mass() -> None:
+    class FixedRandom(random.Random):
+        def __init__(self, value):
+            super().__init__(0)
+            self.value = value
+
+        def randrange(self, stop, *args):
+            assert stop == 3
+            return self.value
+
+    first = canonical_combo(("As", "Kd"))
+    second = canonical_combo(("Qc", "Qd"))
+    hand_range = WeightedRange.from_masses({first: 2, second: 1})
+    ordered = tuple(hand_range.masses)
+    assert hand_range.sample(FixedRandom(0)) == ordered[0]
+    assert hand_range.sample(FixedRandom(1)) == ordered[1]
+    assert hand_range.sample(FixedRandom(2)) == ordered[1]
 
 
 def test_bayes_update_uses_action_likelihood_and_normalizes() -> None:

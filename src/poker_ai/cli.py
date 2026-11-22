@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     advise.add_argument("--button-index", type=int, choices=(0, 1), default=1)
     advise.add_argument(
         "--opponent",
-        choices=("balanced", "tight", "calling", "aggressive"),
+        choices=("balanced", "tight", "calling", "aggressive", "random"),
         default="balanced",
     )
     advise.add_argument("--audit", type=Path, help="append the decision to this JSONL file")
@@ -94,7 +94,6 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("balanced", "tight", "calling", "aggressive", "random"),
         default="balanced",
     )
-    play.add_argument("--baseline-simulations", type=int, default=300)
     play.add_argument("--audit", type=Path, help="append hero decisions to JSONL")
     play.add_argument("--compact", action="store_true", help="omit full decision and PHH payloads")
     _add_simulation_options(play, equity_default=2_000)
@@ -113,7 +112,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--simulations", type=int, default=500)
     evaluate.add_argument("--rollouts", type=int, default=200)
-    evaluate.add_argument("--baseline-simulations", type=int, default=150)
     evaluate.add_argument("--risk-aversion", type=float, default=0.0)
     evaluate.add_argument("--audit", type=Path)
     evaluate.add_argument("--include-hands", action="store_true")
@@ -201,7 +199,6 @@ def _run_play(args: argparse.Namespace) -> int:
         opponent_style=args.opponent,
         equity_simulations=args.simulations,
         rollout_simulations=args.rollouts,
-        baseline_simulations=args.baseline_simulations,
         risk_aversion=args.risk_aversion,
         audit_path=args.audit,
     ).as_dict()
@@ -221,7 +218,6 @@ def _run_evaluate(args: argparse.Namespace) -> int:
         opponent_style=args.opponent,
         equity_simulations=args.simulations,
         rollout_simulations=args.rollouts,
-        baseline_simulations=args.baseline_simulations,
         risk_aversion=args.risk_aversion,
         audit_path=args.audit,
     )

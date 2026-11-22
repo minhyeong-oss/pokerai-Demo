@@ -13,6 +13,7 @@ from .cards import card_code
 from .environment import PokerKitHeadsUpHand, UNITS_PER_BB
 from .evaluate import EvaluationReport, summarize_paired_payoffs
 from .observation import PublicEvent
+from .opponents import OpponentActionModel
 from .seeding import derive_seed, validate_master_seed
 
 
@@ -24,6 +25,7 @@ class PracticeHandResult:
     hero_index: int
     button_index: int
     opponent_style: str
+    opponent_model_parameters: dict[str, float | str]
     hero_cards: tuple[str, str]
     final_board: tuple[str, ...]
     payoffs_bb: tuple[float, float]
@@ -40,6 +42,7 @@ class PracticeHandResult:
 @dataclass(frozen=True)
 class MatchResult:
     opponent_style: str
+    opponent_model_parameters: dict[str, float | str]
     environment_master_seed: int
     hero_policy_master_seed: int
     villain_policy_master_seed: int
@@ -49,6 +52,7 @@ class MatchResult:
     def as_dict(self, *, include_hands: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
             "opponent_style": self.opponent_style,
+            "opponent_model_parameters": self.opponent_model_parameters,
             "environment_master_seed": self.environment_master_seed,
             "hero_policy_master_seed": self.hero_policy_master_seed,
             "villain_policy_master_seed": self.villain_policy_master_seed,
@@ -74,7 +78,6 @@ def play_practice_hand(
     opponent_style: str = "balanced",
     equity_simulations: int = 2_000,
     rollout_simulations: int = 500,
-    baseline_simulations: int = 300,
     risk_aversion: float = 0.0,
     audit_path: str | Path | None = None,
     _pair_index: int | None = None,
@@ -139,11 +142,10 @@ def play_practice_hand(
     )
     initial_hero_observation = environment.observation_for(hero_index)
     hero_cards = initial_hero_observation.hole_cards
-    model_style = "balanced" if opponent_style == "random" else opponent_style
     decisions: list[dict[str, Any]] = []
 
     hero_agent = ResearchPokerAgent(
-        opponent_style=model_style,
+        opponent_style=opponent_style,
         equity_simulations=equity_simulations,
         rollout_simulations=rollout_simulations,
         policy_hand_seed=hero_hand_seed,
@@ -152,7 +154,6 @@ def play_practice_hand(
     )
     opponent = HeuristicBaseline(
         opponent_style,
-        simulations=baseline_simulations,
         policy_hand_seed=villain_hand_seed,
     )
 
@@ -162,15 +163,7 @@ def play_practice_hand(
         return result.action
 
     def opponent_policy(observation):
-        action = opponent(observation)
-        hero_agent.observe_opponent_action(
-            action,
-            hole_cards=hero_cards,
-            board=observation.board,
-            facing_bet=observation.call_cost > 0,
-            event_id=f"{environment.hand_id}:e{len(environment.history)}",
-        )
-        return action
+        return opponent(observation)
 
     policies = {hero_index: hero_policy, 1 - hero_index: opponent_policy}
     try:
@@ -188,6 +181,7 @@ def play_practice_hand(
         hero_index=hero_index,
         button_index=environment.button_index,
         opponent_style=opponent_style,
+        opponent_model_parameters=opponent.parameters,
         hero_cards=hero_cards,
         final_board=final_board,
         payoffs_bb=payoffs_bb,  # type: ignore[arg-type]
@@ -209,7 +203,6 @@ def evaluate_practice_match(
     opponent_style: str = "balanced",
     equity_simulations: int = 500,
     rollout_simulations: int = 200,
-    baseline_simulations: int = 150,
     risk_aversion: float = 0.0,
     audit_path: str | Path | None = None,
 ) -> MatchResult:
@@ -236,7 +229,6 @@ def evaluate_practice_match(
                     opponent_style=opponent_style,
                     equity_simulations=equity_simulations,
                     rollout_simulations=rollout_simulations,
-                    baseline_simulations=baseline_simulations,
                     risk_aversion=risk_aversion,
                     audit_path=audit_path,
                     _pair_index=pair_index,
@@ -246,6 +238,7 @@ def evaluate_practice_match(
     report = summarize_paired_payoffs(hand.hero_payoff_bb for hand in hand_results)
     return MatchResult(
         opponent_style=opponent_style,
+        opponent_model_parameters=OpponentActionModel(opponent_style).parameters.as_dict(),
         environment_master_seed=environment_master_seed,
         hero_policy_master_seed=hero_policy_master_seed,
         villain_policy_master_seed=villain_policy_master_seed,

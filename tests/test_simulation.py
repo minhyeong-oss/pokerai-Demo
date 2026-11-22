@@ -11,7 +11,6 @@ def test_end_to_end_hand_is_reproducible_and_zero_sum() -> None:
         opponent_style="calling",
         equity_simulations=40,
         rollout_simulations=20,
-        baseline_simulations=30,
     )
     first = play_practice_hand(**settings)
     second = play_practice_hand(**settings)
@@ -22,6 +21,7 @@ def test_end_to_end_hand_is_reproducible_and_zero_sum() -> None:
     assert sum(first.payoffs_bb) == 0
     assert sum(first.final_stacks_bb) == 200
     assert first.decision_records
+    assert first.opponent_model_parameters["name"] == "calling"
 
 
 def test_small_match_reports_bb_per_100() -> None:
@@ -34,11 +34,11 @@ def test_small_match_reports_bb_per_100() -> None:
         opponent_style="random",
         equity_simulations=20,
         rollout_simulations=10,
-        baseline_simulations=10,
     )
     assert result.report.hands == 2
     assert len(result.hands) == 2
     assert result.hands[0].deck_seed == result.hands[1].deck_seed
+    assert result.opponent_model_parameters["name"] == "random"
 
 
 def test_run_id_does_not_change_cards_actions_or_settlement() -> None:
@@ -50,7 +50,6 @@ def test_run_id_does_not_change_cards_actions_or_settlement() -> None:
         opponent_style="random",
         equity_simulations=20,
         rollout_simulations=10,
-        baseline_simulations=10,
     )
     first = play_practice_hand(**settings, run_id="run-a")
     second = play_practice_hand(**settings, run_id="run-b")
@@ -73,7 +72,6 @@ def test_policy_master_seed_cannot_change_the_deck_stream() -> None:
         run_id="seed-separation",
         equity_simulations=20,
         rollout_simulations=10,
-        baseline_simulations=10,
     )
     first = play_practice_hand(**common, hero_policy_master_seed=42)
     second = play_practice_hand(**common, hero_policy_master_seed=999)

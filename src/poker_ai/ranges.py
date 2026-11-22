@@ -1,15 +1,11 @@
-"""Opponent hole-card ranges and observable-action Bayesian updates.
-
-Ranges contain probabilities over *possible* two-card holdings.  They never
-contain a distinguished "actual opponent hand"; callers condition them only
-on cards that are public to the hero and on observed actions.
-"""
+"""Quantized opponent ranges and observable-action Bayesian updates."""
 
 from __future__ import annotations
 
 import math
 import random
 from collections.abc import Callable, Iterable, Mapping
+from decimal import Decimal, ROUND_HALF_EVEN
 from itertools import combinations
 from types import MappingProxyType
 from typing import Any, TypeAlias
@@ -17,6 +13,9 @@ from typing import Any, TypeAlias
 from pokerkit import Card
 
 from .cards import CardLike, CardsLike, STANDARD_DECK, parse_cards
+
+
+QUANTIZATION_SCALE = 10**15
 
 HoleCards: TypeAlias = tuple[Card, Card]
 ComboLike: TypeAlias = str | Iterable[CardLike]
@@ -35,6 +34,10 @@ def canonical_combo(cards: ComboLike) -> HoleCards:
     return first, second
 
 
+def combo_sort_key(combo: HoleCards) -> tuple[int, int]:
+    return _CARD_POSITION[combo[0]], _CARD_POSITION[combo[1]]
+
+
 def _validate_weight(value: object, *, label: str, allow_zero: bool = True) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise TypeError(f"{label} must be a real number")
@@ -50,64 +53,95 @@ def _parse_dead_cards(dead_cards: CardsLike | None) -> frozenset[Card]:
     return frozenset(parse_cards(dead_cards, field_name="dead_cards"))
 
 
+def _quantized_masses(weights: Mapping[HoleCards, float]) -> dict[HoleCards, int]:
+    total = math.fsum(weights.values())
+    if total <= 0:
+        raise ValueError("a range must contain at least one positive-weight combo")
+    scale = Decimal(QUANTIZATION_SCALE)
+    masses: dict[HoleCards, int] = {}
+    for combo in sorted(weights, key=combo_sort_key):
+        probability = weights[combo] / total
+        mass = int(
+            (Decimal(str(probability)) * scale).quantize(
+                Decimal("1"), rounding=ROUND_HALF_EVEN
+            )
+        )
+        if mass > 0:
+            masses[combo] = mass
+    if not masses:
+        raise ValueError("range quantization removed every combo")
+    return masses
+
+
 class HandRange:
-    """Read-only probability distribution over two-card holdings."""
+    """Read-only integer-mass distribution over two-card holdings."""
+
+    @property
+    def masses(self) -> Mapping[HoleCards, int]:
+        raise NotImplementedError
+
+    @property
+    def total_mass(self) -> int:
+        raise NotImplementedError
 
     @property
     def weights(self) -> Mapping[HoleCards, float]:
-        """Normalized, unconditioned probabilities for every stored combo."""
+        """Logical probabilities derived from, but not stored over, masses."""
 
-        raise NotImplementedError
+        total = self.total_mass
+        return MappingProxyType({combo: mass / total for combo, mass in self.masses.items()})
 
     def probabilities(self, dead_cards: CardsLike | None = ()) -> dict[HoleCards, float]:
-        """Return probabilities conditioned on the supplied known cards."""
+        """Return logical probabilities after removing supplied blockers."""
 
         dead = _parse_dead_cards(dead_cards)
         eligible = {
-            combo: weight
-            for combo, weight in self.weights.items()
-            if combo[0] not in dead and combo[1] not in dead and weight > 0
+            combo: mass
+            for combo, mass in self.masses.items()
+            if combo[0] not in dead and combo[1] not in dead and mass > 0
         }
-        total = math.fsum(eligible.values())
+        total = sum(eligible.values())
         if total <= 0:
-            raise ValueError("the range has no positive-weight combo after removing dead cards")
-        return {combo: weight / total for combo, weight in eligible.items()}
+            raise ValueError("the range has no positive-mass combo after removing dead cards")
+        return {combo: mass / total for combo, mass in eligible.items()}
+
+    def conditioned(self, dead_cards: CardsLike | None = ()) -> "WeightedRange":
+        """Remove blockers, normalize, and quantize the resulting distribution."""
+
+        return WeightedRange(self.probabilities(dead_cards))
 
     def sample(
         self,
         rng: random.Random,
         dead_cards: CardsLike | None = (),
     ) -> HoleCards:
-        """Sample a combo after removing holdings blocked by known cards."""
+        """Sample using an integer draw in ``[0, eligible_total_mass)``."""
 
         if not isinstance(rng, random.Random):
             raise TypeError("rng must be an instance of random.Random")
-
-        probabilities = self.probabilities(dead_cards)
-        threshold = rng.random()
-        cumulative = 0.0
-        last_combo: HoleCards | None = None
-        for combo, probability in probabilities.items():
-            last_combo = combo
-            cumulative += probability
+        dead = _parse_dead_cards(dead_cards)
+        eligible = tuple(
+            (combo, mass)
+            for combo, mass in self.masses.items()
+            if combo[0] not in dead and combo[1] not in dead and mass > 0
+        )
+        total = sum(mass for _, mass in eligible)
+        if total <= 0:
+            raise ValueError("the range has no positive-mass combo after removing dead cards")
+        threshold = rng.randrange(total)
+        cumulative = 0
+        for combo, mass in eligible:
+            cumulative += mass
             if threshold < cumulative:
                 return combo
-
-        # Floating-point summation can leave cumulative infinitesimally below
-        # one.  The final eligible combo owns that remainder.
-        assert last_combo is not None
-        return last_combo
+        raise RuntimeError("integer range sampling failed")  # pragma: no cover
 
     def __len__(self) -> int:
-        return len(self.weights)
+        return len(self.masses)
 
 
 class WeightedRange(HandRange):
-    """A normalized range constructed from non-negative combo weights.
-
-    Reversed duplicates such as ``("As", "Kd")`` and ``("Kd", "As")`` are
-    combined before normalization.  Zero-weight entries are omitted.
-    """
+    """A canonical range quantized to fixed integer probability masses."""
 
     def __init__(
         self,
@@ -126,20 +160,46 @@ class WeightedRange(HandRange):
             raise TypeError("weights must contain (two-card combo, numeric weight) pairs") from exc
 
         positive = {combo: weight for combo, weight in combined.items() if weight > 0}
-        total = math.fsum(positive.values())
-        if total <= 0:
-            raise ValueError("a range must contain at least one positive-weight combo")
+        self._set_masses(_quantized_masses(positive))
 
-        ordered = sorted(
-            positive.items(),
-            key=lambda item: (_CARD_POSITION[item[0][0]], _CARD_POSITION[item[0][1]]),
-        )
-        normalized = {combo: weight / total for combo, weight in ordered}
-        self._weights: Mapping[HoleCards, float] = MappingProxyType(normalized)
+    @classmethod
+    def from_masses(
+        cls,
+        masses: Mapping[object, int] | Iterable[tuple[ComboLike, int]],
+    ) -> "WeightedRange":
+        """Restore already-quantized masses without changing their values."""
+
+        items = masses.items() if isinstance(masses, Mapping) else masses
+        parsed: dict[HoleCards, int] = {}
+        for raw_combo, raw_mass in items:
+            combo = canonical_combo(raw_combo)  # type: ignore[arg-type]
+            if isinstance(raw_mass, bool) or not isinstance(raw_mass, int):
+                raise TypeError(f"mass for {combo} must be an integer")
+            if raw_mass < 0:
+                raise ValueError(f"mass for {combo} cannot be negative")
+            if raw_mass > 0:
+                parsed[combo] = parsed.get(combo, 0) + raw_mass
+        if not parsed:
+            raise ValueError("a range must contain at least one positive mass")
+        instance = cls.__new__(cls)
+        instance._set_masses(parsed)
+        return instance
+
+    def _set_masses(self, masses: Mapping[HoleCards, int]) -> None:
+        ordered = {combo: masses[combo] for combo in sorted(masses, key=combo_sort_key)}
+        total = sum(ordered.values())
+        if total <= 0:
+            raise ValueError("total_mass must be positive")
+        self._masses: Mapping[HoleCards, int] = MappingProxyType(ordered)
+        self._total_mass = total
 
     @property
-    def weights(self) -> Mapping[HoleCards, float]:
-        return self._weights
+    def masses(self) -> Mapping[HoleCards, int]:
+        return self._masses
+
+    @property
+    def total_mass(self) -> int:
+        return self._total_mass
 
 
 class UniformRange(WeightedRange):
@@ -150,18 +210,7 @@ class UniformRange(WeightedRange):
 
 
 class OpponentProfile:
-    """Observable-action likelihood model used for Bayesian range updates.
-
-    Each action maps to one of:
-
-    * a constant likelihood,
-    * a callable ``combo -> likelihood``, or
-    * a mapping of combos to likelihoods (unlisted combos receive zero).
-
-    Likelihoods represent ``P(action | combo, public information)`` and must be
-    between zero and one.  A callable may close over public context such as
-    position or bet size; it must not inspect the simulator's hidden state.
-    """
+    """Observable-action likelihoods used for Bayesian range updates."""
 
     def __init__(self, name: str, action_likelihoods: Mapping[str, LikelihoodSpec]) -> None:
         if not isinstance(name, str) or not name.strip():
@@ -176,7 +225,6 @@ class OpponentProfile:
             action = raw_action.strip().lower()
             if action in parsed:
                 raise ValueError(f"duplicate action after normalization: {action!r}")
-
             if callable(raw_spec):
                 spec: LikelihoodSpec = raw_spec
             elif isinstance(raw_spec, Mapping):
@@ -184,14 +232,12 @@ class OpponentProfile:
                 for raw_combo, raw_value in raw_spec.items():
                     combo = canonical_combo(raw_combo)  # type: ignore[arg-type]
                     combo_values[combo] = _validate_likelihood(
-                        raw_value,
-                        label=f"{action} likelihood for {combo}",
+                        raw_value, label=f"{action} likelihood for {combo}"
                     )
                 spec = MappingProxyType(combo_values)
             else:
                 spec = _validate_likelihood(raw_spec, label=f"{action} likelihood")
             parsed[action] = spec
-
         self.name = name.strip()
         self._action_likelihoods: Mapping[str, LikelihoodSpec] = MappingProxyType(parsed)
 
@@ -200,8 +246,6 @@ class OpponentProfile:
         return tuple(self._action_likelihoods)
 
     def likelihood(self, action: str, combo: ComboLike) -> float:
-        """Return ``P(action | combo)`` for one possible holding."""
-
         if not isinstance(action, str) or not action.strip():
             raise ValueError("action must be a non-empty string")
         normalized_action = action.strip().lower()
@@ -209,9 +253,8 @@ class OpponentProfile:
             spec = self._action_likelihoods[normalized_action]
         except KeyError as exc:
             raise KeyError(
-                f"profile {self.name!r} has no likelihood for action {normalized_action!r}",
+                f"profile {self.name!r} has no likelihood for action {normalized_action!r}"
             ) from exc
-
         parsed_combo = canonical_combo(combo)
         if callable(spec):
             raw_value = spec(parsed_combo)
@@ -220,8 +263,7 @@ class OpponentProfile:
         else:
             raw_value = spec
         return _validate_likelihood(
-            raw_value,
-            label=f"{normalized_action} likelihood for {parsed_combo}",
+            raw_value, label=f"{normalized_action} likelihood for {parsed_combo}"
         )
 
 
@@ -239,11 +281,7 @@ def bayes_update(
     *,
     dead_cards: CardsLike | None = (),
 ) -> WeightedRange:
-    """Condition a hand range on one observed opponent action.
-
-    The returned weights are proportional to
-    ``P(action | combo) * P(combo)`` after removing public dead cards.
-    """
+    """Condition a range on one observed public action and quantize it."""
 
     if isinstance(prior, Mapping):
         prior = WeightedRange(prior)
@@ -251,7 +289,6 @@ def bayes_update(
         raise TypeError("prior must be a HandRange or combo-to-weight mapping")
     if not isinstance(profile, OpponentProfile):
         raise TypeError("profile must be an OpponentProfile")
-
     prior_probabilities = prior.probabilities(dead_cards)
     posterior = {
         combo: probability * profile.likelihood(action, combo)
@@ -259,7 +296,7 @@ def bayes_update(
     }
     if math.fsum(posterior.values()) <= 0:
         raise ValueError(
-            f"action {action!r} has zero total likelihood under profile {profile.name!r}",
+            f"action {action!r} has zero total likelihood under profile {profile.name!r}"
         )
     return WeightedRange(posterior)
 
@@ -270,8 +307,10 @@ __all__ = [
     "HoleCards",
     "LikelihoodFunction",
     "OpponentProfile",
+    "QUANTIZATION_SCALE",
     "UniformRange",
     "WeightedRange",
     "bayes_update",
     "canonical_combo",
+    "combo_sort_key",
 ]

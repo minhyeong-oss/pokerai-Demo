@@ -36,7 +36,7 @@ def test_advise_command_logs_chosen_action(capsys) -> None:
 def test_play_compact_command(capsys) -> None:
     code = main([
         "play", "--environment-master-seed", "2", "--simulations", "20", "--rollouts", "10",
-        "--baseline-simulations", "10", "--compact",
+        "--compact",
     ])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)

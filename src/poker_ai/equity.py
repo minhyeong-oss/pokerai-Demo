@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import bisect
 import math
 import random
 import secrets
@@ -195,18 +194,8 @@ def _prepare_range_sampler(
     opponent_range: HandRange,
     known_cards: frozenset[Card],
 ):
-    probabilities = opponent_range.probabilities(tuple(known_cards))
-    combos = tuple(probabilities)
-    cumulative: list[float] = []
-    running = 0.0
-    for probability in probabilities.values():
-        running += probability
-        cumulative.append(running)
-    cumulative[-1] = 1.0
-
     def sample(rng: random.Random) -> HoleCards:
-        index = bisect.bisect_right(cumulative, rng.random())
-        return combos[min(index, len(combos) - 1)]
+        return opponent_range.sample(rng, tuple(known_cards))
 
     return sample
 

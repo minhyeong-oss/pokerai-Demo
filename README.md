@@ -11,12 +11,12 @@
 ## 현재 구현된 범위
 
 - 상대 1~9명의 몬테카를로 승률·무승부·에쿼티와 95% 신뢰구간
-- 균등/가중 상대 레인지, 카드 블로커 제거, 관측 행동에 따른 베이지안 갱신
+- `10^15` 정수 질량 상대 레인지, 카드 블로커 제거, 공개 이벤트 기반 베이지안 갱신
 - 상황별 체크 또는 폴드·콜과 최소/0.5팟/1팟/올인 `raise_to` 후보 생성
 - 행동별 순칩 EV와 불확실성 비교
 - PokerKit 기반 2인 100BB 한 핸드 자동 진행 및 정확한 정산
-- tight/calling/aggressive/balanced/random 기준 상대
-- 모든 판단의 JSON/JSONL 감사 로그와 PokerKit PHH 재생 기록
+- 동일한 softmax 행동 모델을 공유하는 tight/calling/aggressive/balanced/random 기준 상대
+- 판단 로그가 참조하는 내용 해시 기반 gzip 레인지 스냅샷과 PokerKit PHH 재생 기록
 - 좌석을 번갈아 평가하는 bb/100 및 95% 신뢰구간 보고
 - 확장 전 학습 파이프라인 검증용 Kuhn poker CFR
 - 화면 입력용 타입 경계(실제 화면 캡처/클릭은 의도적으로 미구현)
@@ -148,6 +148,7 @@ python3.11 -m venv .venv
 | `observation.py` | 숨은 정보가 없는 불변 입력 DTO |
 | `equity.py` | 승/무/패와 split-pot 에쿼티 몬테카를로 |
 | `ranges.py` | 상대 패 확률분포와 베이지안 갱신 |
+| `range_snapshots.py` | 양자화 레인지의 압축·내용 주소 저장과 무결성 검증 |
 | `actions.py` | 합법 행동 추상화와 `raise_to` 크기 |
 | `rollout.py` | 상대 폴드/콜과 쇼다운의 공개정보 롤아웃 |
 | `policy.py` | 행동별 EV·CI 비교와 최종 선택 |

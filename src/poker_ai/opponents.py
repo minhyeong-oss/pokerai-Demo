@@ -1,53 +1,45 @@
-"""Explicit, inspectable baseline opponent models.
-
-These profiles are deliberately simple.  They provide a reproducible baseline
-for testing range updates and action EVs; they are not presented as solved or
-casino-grade poker strategy.
-"""
+"""Shared, explicit opponent action model for likelihoods and baselines."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 import math
-from typing import Callable, Iterable
+from types import MappingProxyType
+from typing import Iterable, Mapping, Sequence
 
 from pokerkit import Card
 
-from .cards import CardsLike, parse_cards
-from .ranges import HandRange, HoleCards, OpponentProfile
+from .actions import CandidateAction
+from .cards import CardsLike, parse_cards, validate_unique_cards
+from .ranges import HandRange, HoleCards, OpponentProfile, canonical_combo
+from .seeding import action_candidate_id
 
 
 _RANK_VALUE = {
-    "2": 2,
-    "3": 3,
-    "4": 4,
-    "5": 5,
-    "6": 6,
-    "7": 7,
-    "8": 8,
-    "9": 9,
-    "T": 10,
-    "J": 11,
-    "Q": 12,
-    "K": 13,
-    "A": 14,
+    "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8,
+    "9": 9, "T": 10, "J": 11, "Q": 12, "K": 13, "A": 14,
 }
 
 
 @dataclass(frozen=True)
 class StyleParameters:
     name: str
-    fold_bias: float
-    call_bias: float
-    aggression: float
-    bluff_frequency: float
+    f0: float
+    c0: float
+    r0: float
+    b: float
+    epsilon: float = 0.01
+
+    def as_dict(self) -> dict[str, float | str]:
+        return asdict(self)
 
 
 STYLES = {
-    "balanced": StyleParameters("balanced", 0.30, 0.48, 0.42, 0.08),
-    "tight": StyleParameters("tight", 0.52, 0.30, 0.34, 0.03),
-    "calling": StyleParameters("calling", 0.13, 0.72, 0.20, 0.03),
-    "aggressive": StyleParameters("aggressive", 0.24, 0.32, 0.68, 0.18),
+    "balanced": StyleParameters("balanced", 1.0, 0.0, -1.0, 0.0),
+    "tight": StyleParameters("tight", 2.0, -0.5, -2.0, -0.5),
+    "calling": StyleParameters("calling", -1.0, 2.0, -2.0, -0.5),
+    "aggressive": StyleParameters("aggressive", 0.0, 0.0, 1.0, 0.5),
+    "random": StyleParameters("random", 0.0, 0.0, 0.0, 0.0),
 }
 
 
@@ -67,142 +59,218 @@ def _suit(card: Card) -> str:
     return repr(card)[1]
 
 
+def _best_five_value(cards: Sequence[Card]) -> tuple[int, tuple[int, ...]]:
+    from itertools import combinations
+
+    best: tuple[int, tuple[int, ...]] | None = None
+    for five in combinations(cards, 5):
+        ranks = sorted((_rank(card) for card in five), reverse=True)
+        counts = {rank: ranks.count(rank) for rank in set(ranks)}
+        groups = sorted(((count, rank) for rank, count in counts.items()), reverse=True)
+        flush = len({_suit(card) for card in five}) == 1
+        unique = sorted(set(ranks), reverse=True)
+        if unique == [14, 5, 4, 3, 2]:
+            straight_high = 5
+        elif len(unique) == 5 and unique[0] - unique[-1] == 4:
+            straight_high = unique[0]
+        else:
+            straight_high = 0
+
+        if flush and straight_high:
+            value = (8, (straight_high,))
+        elif groups[0][0] == 4:
+            value = (7, (groups[0][1], groups[1][1]))
+        elif groups[0][0] == 3 and groups[1][0] == 2:
+            value = (6, (groups[0][1], groups[1][1]))
+        elif flush:
+            value = (5, tuple(ranks))
+        elif straight_high:
+            value = (4, (straight_high,))
+        elif groups[0][0] == 3:
+            kickers = sorted((rank for rank in ranks if rank != groups[0][1]), reverse=True)
+            value = (3, (groups[0][1], *kickers))
+        elif groups[0][0] == 2 and groups[1][0] == 2:
+            high_pair = max(groups[0][1], groups[1][1])
+            low_pair = min(groups[0][1], groups[1][1])
+            kicker = next(rank for rank in ranks if rank not in (high_pair, low_pair))
+            value = (2, (high_pair, low_pair, kicker))
+        elif groups[0][0] == 2:
+            pair = groups[0][1]
+            kickers = sorted((rank for rank in ranks if rank != pair), reverse=True)
+            value = (1, (pair, *kickers))
+        else:
+            value = (0, tuple(ranks))
+        if best is None or value > best:
+            best = value
+    if best is None:
+        raise ValueError("postflop strength requires at least five total cards")
+    return best
+
+
 def visible_hand_strength(combo: HoleCards, board_cards: Iterable[Card] = ()) -> float:
-    """Return a cheap public-information strength feature in ``[0, 1]``.
+    """Return the exact PRD v1.3 heuristic feature ``h`` in ``[0, 1]``."""
 
-    This is a feature for the baseline likelihood model, not an equity
-    calculator.  It considers hole ranks, pairing, board interaction, flush
-    density, and rough connectivity without looking at any hidden card.
-    """
-
-    first, second = combo
-    ranks = sorted((_rank(first), _rank(second)), reverse=True)
-    suited = _suit(first) == _suit(second)
-    gap = abs(ranks[0] - ranks[1])
-
-    if ranks[0] == ranks[1]:
-        strength = 0.48 + 0.035 * ranks[0]
-    else:
-        strength = 0.04 + 0.026 * ranks[0] + 0.012 * ranks[1]
-        if suited:
-            strength += 0.06
-        if gap <= 1:
-            strength += 0.06
-        elif gap == 2:
-            strength += 0.03
-
+    combo = canonical_combo(combo)
     board = tuple(board_cards)
-    if board:
-        board_ranks = [_rank(card) for card in board]
-        board_suits = [_suit(card) for card in board]
-        for hole_rank in ranks:
-            matches = board_ranks.count(hole_rank)
-            strength += 0.18 * matches
-        if ranks[0] == ranks[1]:
-            strength += 0.08
+    validate_unique_cards(combo, board, field_names=("combo", "board_cards"))
+    high, low = sorted((_rank(combo[0]), _rank(combo[1])), reverse=True)
+    if not board:
+        pair = float(high == low)
+        suited = float(_suit(combo[0]) == _suit(combo[1]))
+        adjacent = float(high - low == 1)
+        value = (
+            (high + low - 4) / 24
+            + 0.35 * pair
+            + 0.08 * suited
+            + 0.05 * adjacent
+        ) / 1.35
+        return max(0.0, min(1.0, value))
 
-        suit_counts = {
-            suit: board_suits.count(suit) + sum(_suit(card) == suit for card in combo)
-            for suit in "cdhs"
+    category, vector = _best_five_value((*combo, *board))
+    padded = (*vector[:5], *(0 for _ in range(5 - len(vector))))
+    kicker_fraction = math.fsum(rank / (15**index) for index, rank in enumerate(padded, 1))
+    return (category + kicker_fraction) / 9
+
+
+def _softmax(scores: Mapping[str, float]) -> dict[str, float]:
+    maximum = max(scores.values())
+    exponentials = {key: math.exp(value - maximum) for key, value in scores.items()}
+    total = math.fsum(exponentials.values())
+    return {key: value / total for key, value in exponentials.items()}
+
+
+class OpponentActionModel:
+    """One shared candidate distribution used by inference and actual play."""
+
+    def __init__(self, style: str | StyleParameters = "balanced") -> None:
+        self.parameters = get_style(style) if isinstance(style, str) else style
+        if not isinstance(self.parameters, StyleParameters):
+            raise TypeError("style must be a style name or StyleParameters")
+        if not 0.0 <= self.parameters.epsilon < 1.0:
+            raise ValueError("epsilon must be in [0, 1)")
+
+    @property
+    def name(self) -> str:
+        return self.parameters.name
+
+    def probabilities(
+        self,
+        combo: HoleCards,
+        *,
+        board_cards: CardsLike | None,
+        pot: int,
+        call_cost: int,
+        own_street_contribution: int,
+        candidate_actions: Sequence[CandidateAction],
+    ) -> Mapping[CandidateAction, float]:
+        candidates = tuple(candidate_actions)
+        if not candidates:
+            raise ValueError("candidate_actions cannot be empty")
+        if not all(isinstance(action, CandidateAction) for action in candidates):
+            raise TypeError("candidate_actions must contain CandidateAction values")
+        if len(set(candidates)) != len(candidates):
+            raise ValueError("candidate_actions cannot contain duplicates")
+        for name, amount in (
+            ("pot", pot),
+            ("call_cost", call_cost),
+            ("own_street_contribution", own_street_contribution),
+        ):
+            if isinstance(amount, bool) or not isinstance(amount, int):
+                raise TypeError(f"{name} must be an integer chip amount")
+            if amount < 0:
+                raise ValueError(f"{name} cannot be negative")
+
+        if self.name == "random":
+            probability = 1.0 / len(candidates)
+            return MappingProxyType({action: probability for action in candidates})
+
+        board = parse_cards(board_cards, field_name="board_cards")
+        h = visible_hand_strength(canonical_combo(combo), board)
+        q = call_cost / max(1, pot + call_cost)
+        p = self.parameters
+        family_scores_all = {
+            "fold": p.f0 - 4 * h + 2 * q,
+            "check": 0.0,
+            "call": p.c0 + 2 * h - 2 * q,
+            "raise": p.r0 + 4 * h - q,
         }
-        maximum_suit_count = max(suit_counts.values())
-        if maximum_suit_count >= 5:
-            strength += 0.24
-        elif maximum_suit_count == 4:
-            strength += 0.09
+        families = tuple(dict.fromkeys(action.kind for action in candidates))
+        family_probabilities = _softmax({kind: family_scores_all[kind] for kind in families})
+        raises = tuple(action for action in candidates if action.kind == "raise")
+        if raises:
+            size_scores = {}
+            for action in raises:
+                assert action.raise_to is not None
+                z = (
+                    action.raise_to - own_street_contribution - call_cost
+                ) / max(1, pot + call_cost)
+                size_scores[action_candidate_id(action)] = (2 * h - 1 + p.b) * z
+            size_probabilities = _softmax(size_scores)
+        else:
+            size_probabilities = {}
 
-        unique_ranks = set(board_ranks + ranks)
-        if 14 in unique_ranks:
-            unique_ranks.add(1)  # Ace may be low in A-2-3-4-5.
-        longest = 1
-        run = 1
-        ordered = sorted(unique_ranks)
-        for previous, current in zip(ordered, ordered[1:]):
-            if current == previous + 1:
-                run += 1
-                longest = max(longest, run)
-            elif current != previous:
-                run = 1
-        if longest >= 5:
-            strength += 0.18
-        elif longest == 4:
-            strength += 0.07
+        base: dict[CandidateAction, float] = {}
+        for action in candidates:
+            family_probability = family_probabilities[action.kind]
+            if action.kind == "raise":
+                base[action] = family_probability * size_probabilities[action_candidate_id(action)]
+            else:
+                base[action] = family_probability
+        epsilon_share = p.epsilon / len(candidates)
+        mixed = {
+            action: (1.0 - p.epsilon) * probability + epsilon_share
+            for action, probability in base.items()
+        }
+        normalizer = math.fsum(mixed.values())
+        return MappingProxyType({action: probability / normalizer for action, probability in mixed.items()})
 
-    return max(0.01, min(0.99, strength))
+    def probability(self, action: CandidateAction, combo: HoleCards, **context: object) -> float:
+        probabilities = self.probabilities(combo, **context)  # type: ignore[arg-type]
+        try:
+            return probabilities[action]
+        except KeyError as exc:
+            raise ValueError("action is not in the supplied candidate set") from exc
 
 
 def make_range_profile(
     style_name: str,
     *,
-    board_cards: CardsLike | None = (),
-    facing_bet: bool,
+    board_cards: CardsLike | None,
+    pot: int,
+    call_cost: int,
+    own_street_contribution: int,
+    candidate_actions: Sequence[CandidateAction],
 ) -> OpponentProfile:
-    """Build observable-action likelihoods for a named baseline style."""
+    """Adapt the shared candidate model to the Bayesian range API."""
 
-    style = get_style(style_name)
-    board = parse_cards(board_cards, field_name="board_cards")
-
-    def strength(combo: HoleCards) -> float:
-        return visible_hand_strength(combo, board)
-
-    if facing_bet:
-        def probabilities(combo: HoleCards) -> tuple[float, float, float]:
-            value = strength(combo)
-            raw_fold = 0.02 + style.fold_bias * (1.15 - value)
-            raw_call = 0.02 + style.call_bias * (0.30 + 0.70 * value)
-            raw_raise = 0.01 + style.bluff_frequency + style.aggression * value * value
-            total = raw_fold + raw_call + raw_raise
-            return raw_fold / total, raw_call / total, raw_raise / total
-
-        fold_likelihood = lambda combo: probabilities(combo)[0]
-        call_likelihood = lambda combo: probabilities(combo)[1]
-        raise_likelihood = lambda combo: probabilities(combo)[2]
-        check_likelihood: Callable[[HoleCards], float] = lambda combo: 0.0
-    else:
-        def unopened_probabilities(combo: HoleCards) -> tuple[float, float]:
-            value = strength(combo)
-            raw_check = 0.05 + (1.05 - style.aggression) * (1.05 - value)
-            raw_raise = 0.01 + style.bluff_frequency + style.aggression * (value ** 1.7)
-            total = raw_check + raw_raise
-            return raw_check / total, raw_raise / total
-
-        check_likelihood = lambda combo: unopened_probabilities(combo)[0]
-        raise_likelihood = lambda combo: unopened_probabilities(combo)[1]
-        call_likelihood = lambda combo: 0.0
-        fold_likelihood = lambda combo: 0.0
-
-    return OpponentProfile(
-        f"{style.name}:{'facing_bet' if facing_bet else 'unopened'}",
-        {
-            "fold": fold_likelihood,
-            "check": check_likelihood,
-            "call": call_likelihood,
-            "raise": raise_likelihood,
-            "all_in": raise_likelihood,
-        },
-    )
+    model = OpponentActionModel(style_name)
+    candidates = tuple(candidate_actions)
+    likelihoods = {}
+    for candidate in candidates:
+        key = action_candidate_id(candidate)
+        likelihoods[key] = lambda combo, candidate=candidate: model.probability(
+            candidate,
+            combo,
+            board_cards=board_cards,
+            pot=pot,
+            call_cost=call_cost,
+            own_street_contribution=own_street_contribution,
+            candidate_actions=candidates,
+        )
+    return OpponentProfile(f"{model.name}:candidate-model-v1", likelihoods)
 
 
-def estimate_fold_probability(
-    style_name: str,
-    *,
-    raise_cost: float,
-    pot: float,
-) -> float:
-    """Return a bounded aggregate fold estimate for a proposed raise."""
+def estimate_fold_probability(style_name: str, *, raise_cost: float, pot: float) -> float:
+    """Compatibility aggregate used by the current rollout until stage 7."""
 
-    if not all(
-        isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(float(value))
-        and float(value) >= 0.0
-        for value in (raise_cost, pot)
-    ):
-        raise ValueError("raise_cost and pot must be finite, non-negative numbers")
-    style = get_style(style_name)
-    pressure = raise_cost / max(pot + raise_cost, 1e-9)
-    estimate = style.fold_bias + (0.55 - style.call_bias * 0.35) * pressure
-    return max(0.02, min(0.90, estimate))
+    if raise_cost < 0 or pot < 0:
+        raise ValueError("raise_cost and pot must be non-negative")
+    if style_name == "random":
+        return 0.5
+    p = get_style(style_name)
+    q = float(raise_cost) / max(1.0, float(pot) + float(raise_cost))
+    probabilities = _softmax({"fold": p.f0 - 2.0 + 2 * q, "call": p.c0 + 1.0 - 2 * q})
+    return (1.0 - p.epsilon) * probabilities["fold"] + p.epsilon / 2
 
 
 def range_fold_probability(
@@ -214,29 +282,33 @@ def range_fold_probability(
     raise_cost: float,
     pot: float,
 ) -> float:
-    """Aggregate ``P(fold|hand, public state)`` over the current range."""
+    """Aggregate fold probability with the shared model over a range."""
 
     if not isinstance(opponent_range, HandRange):
         raise TypeError("opponent_range must be a HandRange")
-    profile = make_range_profile(
-        style_name,
-        board_cards=board_cards,
-        facing_bet=True,
-    )
+    call_cost = int(raise_cost)
+    pot_chips = int(pot)
+    candidates = (CandidateAction("fold"), CandidateAction("call"))
+    model = OpponentActionModel(style_name)
     dead_cards = (*parse_cards(hero_cards), *parse_cards(board_cards))
     probabilities = opponent_range.probabilities(dead_cards)
-    base = math.fsum(
-        probability * profile.likelihood("fold", combo)
-        for combo, probability in probabilities.items()
+    return math.fsum(
+        range_probability
+        * model.probability(
+            CandidateAction("fold"),
+            combo,
+            board_cards=board_cards,
+            pot=pot_chips,
+            call_cost=call_cost,
+            own_street_contribution=0,
+            candidate_actions=candidates,
+        )
+        for combo, range_probability in probabilities.items()
     )
-    # The explicit profile represents a medium wager.  Move its odds smoothly
-    # toward more folds as the amount the opponent must add grows.
-    pressure = float(raise_cost) / max(float(pot) + float(raise_cost), 1e-9)
-    adjusted = base + (1.0 - base) * 0.55 * pressure
-    return max(0.01, min(0.95, adjusted))
 
 
 __all__ = [
+    "OpponentActionModel",
     "STYLES",
     "StyleParameters",
     "estimate_fold_probability",
