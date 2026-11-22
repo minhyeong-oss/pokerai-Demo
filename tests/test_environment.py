@@ -156,9 +156,9 @@ def test_illegal_actions_are_rejected_without_mutating_state() -> None:
 
     with pytest.raises(ValueError, match="check is not legal"):
         hand.apply_action(CandidateAction("check"))
-    with pytest.raises(ValueError, match="inclusive legal range"):
+    with pytest.raises(ValueError, match="legal full-raise range"):
         hand.apply_action(CandidateAction("raise", 199))
-    with pytest.raises(ValueError, match="inclusive legal range"):
+    with pytest.raises(ValueError, match="legal full-raise range"):
         hand.apply_action(CandidateAction("raise", 10_001))
 
     after = (
@@ -247,6 +247,30 @@ def test_asymmetric_starting_stacks_settle_and_conserve_exact_total() -> None:
     assert hand.payoffs == tuple(
         stack - starting
         for stack, starting in zip(hand.stacks, (4_000, 10_000))
+    )
+
+
+def test_short_all_in_candidate_matches_pokerkit_legality() -> None:
+    short_raise = PokerKitHeadsUpHand(
+        seed=13,
+        starting_stacks=(10_000, 150),
+        run_id="short-raise",
+    )
+    observation = short_raise.observation_for(1)
+    candidates = generate_candidate_actions(observation)
+    assert CandidateAction("raise", 150) in candidates
+    short_raise.apply_action(CandidateAction("raise", 150))
+
+    call_only = PokerKitHeadsUpHand(
+        seed=14,
+        starting_stacks=(10_000, 100),
+        run_id="call-only",
+    )
+    observation = call_only.observation_for(1)
+    assert observation.call_cost == observation.stacks[1] == 50
+    assert all(
+        candidate.kind != "raise"
+        for candidate in generate_candidate_actions(observation)
     )
 
 

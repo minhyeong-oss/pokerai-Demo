@@ -41,7 +41,9 @@ class LegalActions:
     """Actions and raise bounds supplied by the game engine.
 
     ``min_raise_to`` and ``max_raise_to`` are both ``None`` when raising is not
-    legal.  Otherwise they are inclusive bounds in raise-to units.
+    legal.  Normally they are inclusive bounds.  For an engine-approved short
+    all-in, ``max_raise_to`` may be below the minimum full-raise amount and is
+    then the only aggressive target.
     """
 
     check: bool
@@ -68,8 +70,9 @@ class LegalActions:
         maximum_value = _chip_amount(maximum, "max_raise_to")
         if minimum_value < 0 or maximum_value < 0:
             raise ValueError("raise bounds cannot be negative")
-        if minimum_value > maximum_value:
-            raise ValueError("min_raise_to cannot exceed max_raise_to")
+        # PokerKit may expose a short all-in whose maximum is below the
+        # minimum amount that would constitute a full raise.  In that case the
+        # maximum itself is the only aggressive target.
         object.__setattr__(self, "min_raise_to", minimum_value)
         object.__setattr__(self, "max_raise_to", maximum_value)
 
@@ -106,10 +109,6 @@ class CandidateAction:
         return self.kind == "raise"
 
 
-def _clamp(value: int, minimum: int, maximum: int) -> int:
-    return max(minimum, min(value, maximum))
-
-
 def _deduplicate_amounts(amounts: Sequence[int]) -> Tuple[int, ...]:
     unique: list[int] = []
     for amount in amounts:
@@ -124,25 +123,27 @@ def generate_candidate_actions(
 ) -> Tuple[CandidateAction, ...]:
     """Return legal passive actions plus a compact set of raise sizes.
 
-    The aggressive abstraction always considers min raise, the requested pot
-    fractions, and max raise.  Fractional sizes use the pot *after calling*::
+    Fractional sizes use the pot *after calling*::
 
         raise_to = hero_street_contribution + call_cost
                    + floor(fraction * (pot + call_cost))
 
-    Every proposed size is clamped to the inclusive legal range, then duplicate
-    sizes are removed while retaining deterministic order.  Returned raise
-    actions are sorted by amount, which makes logs and seeded runs stable.
+    When facing a bet, the minimum full raise is also considered.  With no call
+    cost it is omitted.  Out-of-range fraction sizes are removed rather than
+    clamped.  The all-in target is ``B + S`` and duplicates are removed.
     """
 
     legal = observation.legal_actions
+    call_cost = observation.call_cost
     actions = []
-    if legal.fold:
-        actions.append(CandidateAction("fold"))
-    if legal.check:
-        actions.append(CandidateAction("check"))
-    if legal.call:
-        actions.append(CandidateAction("call"))
+    if call_cost == 0:
+        if legal.check:
+            actions.append(CandidateAction("check"))
+    else:
+        if legal.fold:
+            actions.append(CandidateAction("fold"))
+        if legal.call:
+            actions.append(CandidateAction("call"))
 
     if not legal.can_raise:
         if not actions:
@@ -153,21 +154,31 @@ def generate_candidate_actions(
     maximum = legal.max_raise_to
     assert minimum is not None and maximum is not None
     hero_contribution = observation.street_contributions[observation.hero_index]
-    call_cost = observation.call_cost
     pot = observation.pot
     base_after_call = hero_contribution + call_cost
     pot_after_call = pot + call_cost
 
-    raw_sizes = [minimum]
+    hero_stack = observation.stacks[observation.hero_index]
+    if call_cost >= hero_stack:
+        if not actions:
+            raise ValueError("observation has no legal candidate action")
+        return tuple(actions)
+
+    raw_sizes = [minimum] if call_cost > 0 else []
     for fraction in pot_fractions:
         fraction_value = _finite_fraction(fraction, "pot fraction")
         if fraction_value < 0.0:
             raise ValueError("pot fractions cannot be negative")
         raw_sizes.append(base_after_call + math.floor(fraction_value * pot_after_call))
-    raw_sizes.append(maximum)
+    general_sizes = [size for size in raw_sizes if minimum <= size <= maximum]
 
-    clamped = [_clamp(size, minimum, maximum) for size in raw_sizes]
-    for amount in sorted(_deduplicate_amounts(clamped)):
+    all_in_to = hero_contribution + hero_stack
+    full_raise_all_in = minimum <= all_in_to <= maximum
+    short_all_in = maximum < minimum and all_in_to == maximum
+    if full_raise_all_in or short_all_in:
+        general_sizes.append(all_in_to)
+
+    for amount in sorted(_deduplicate_amounts(general_sizes)):
         actions.append(CandidateAction("raise", amount))
 
     if not actions:

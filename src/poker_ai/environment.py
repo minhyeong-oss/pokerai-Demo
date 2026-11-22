@@ -391,10 +391,12 @@ class PokerKitHeadsUpHand:
                 raise ValueError("raise is not legal in the current state")
 
             requested = action.raise_to
-            if requested < minimum or requested > maximum:
+            full_raise = minimum <= requested <= maximum
+            short_all_in = maximum < minimum and requested == maximum
+            if not (full_raise or short_all_in):
                 raise ValueError(
-                    "raise_to must be within the inclusive legal range "
-                    f"[{minimum}, {maximum}] chips",
+                    "raise_to must be within the legal full-raise range or "
+                    "equal the engine-approved short all-in target",
                 )
 
             if not self._state.can_complete_bet_or_raise_to(requested):

@@ -149,11 +149,12 @@ class ObservationTests(unittest.TestCase):
 
 
 class LegalActionsTests(unittest.TestCase):
-    def test_raise_bounds_are_a_pair(self):
+    def test_raise_bounds_are_a_pair_and_allow_short_all_in(self):
         with self.assertRaises(ValueError):
             LegalActions(True, False, False, min_raise_to=200)
-        with self.assertRaises(ValueError):
-            LegalActions(False, True, True, min_raise_to=500, max_raise_to=400)
+        legal = LegalActions(False, True, True, min_raise_to=500, max_raise_to=400)
+        self.assertTrue(legal.can_raise)
+        self.assertEqual(legal.max_raise_to, 400)
 
 
 if __name__ == "__main__":
