@@ -5,26 +5,28 @@ import tempfile
 import unittest
 
 from poker_ai.actions import LegalActions
-from poker_ai.logging import JsonlAuditWriter, make_audit_record
+from poker_ai.logging import JsonlAuditWriter, make_audit_record, validate_audit_schema
 from poker_ai.observation import Observation
 from poker_ai.policy import choose_action
 
 
 def make_observation():
     return Observation(
-        hero_cards=("As", "Qh"),
+        hand_id="audit:h0",
+        decision_id="audit:h0:d0",
+        hole_cards=("As", "Qh"),
         board=(),
         street="preflop",
         hero_index=0,
         button_index=0,
         actor_index=0,
-        pot=30.0,
-        to_call=10.0,
-        stacks=(90.0, 90.0),
-        street_contributions=(10.0, 10.0),
-        hand_contributions=(10.0, 10.0),
-        player_statuses=("active", "active"),
-        action_history=({"actor_index": 1, "kind": "bet", "amount": 10.0},),
+        pot=3000,
+        call_cost=1000,
+        stacks=(9000, 9000),
+        street_contributions=(1000, 1000),
+        hand_contributions=(1000, 1000),
+        statuses=("active", "active"),
+        public_history=(),
         legal_actions=LegalActions(False, True, True),
     )
 
@@ -48,7 +50,9 @@ class AuditLoggingTests(unittest.TestCase):
 
         json.dumps(record, allow_nan=False)
         self.assertEqual(record["timestamp"], "2026-10-14T00:00:00Z")
-        self.assertEqual(record["observation"]["hero_cards"], ["As", "Qh"])
+        self.assertEqual(record["schema_version"], 2)
+        self.assertEqual(record["program_version"], "0.2.0")
+        self.assertEqual(record["observation"]["hole_cards"], ["As", "Qh"])
         self.assertEqual(record["decision"]["action"]["kind"], "call")
         self.assertEqual(record["metadata"], {"seed": 42})
 
@@ -68,9 +72,15 @@ class AuditLoggingTests(unittest.TestCase):
 
             lines = path.read_text(encoding="utf-8").splitlines()
             self.assertEqual(len(lines), 2)
-            self.assertEqual(json.loads(lines[0])["schema_version"], 1)
+            self.assertEqual(json.loads(lines[0])["schema_version"], 2)
             self.assertEqual(json.loads(lines[1])["event"], "hand_end")
             self.assertTrue(writer.closed)
+
+    def test_unsupported_audit_schema_is_rejected_explicitly(self):
+        with self.assertRaisesRegex(ValueError, "unsupported audit schema"):
+            validate_audit_schema({"schema_version": 1})
+        with self.assertRaisesRegex(ValueError, "unsupported audit schema"):
+            JsonlAuditWriter("unused.jsonl").write({"schema_version": 99})
 
 
 if __name__ == "__main__":

@@ -16,19 +16,24 @@ if TYPE_CHECKING:  # Avoid a runtime cycle: observation imports LegalActions.
 
 
 _ACTION_KINDS = frozenset(("fold", "check", "call", "raise"))
-_AMOUNT_TOLERANCE = 1e-9
 
 
-def _finite_amount(value: object, name: str) -> float:
+def _chip_amount(value: object, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError("{} must be an integer chip amount".format(name))
+    return value
+
+
+def _finite_fraction(value: object, name: str) -> float:
     if isinstance(value, bool):
         raise TypeError("{} must be a number, not bool".format(name))
     try:
-        amount = float(value)
+        fraction = float(value)
     except (TypeError, ValueError) as exc:
         raise TypeError("{} must be a finite number".format(name)) from exc
-    if not math.isfinite(amount):
+    if not math.isfinite(fraction):
         raise ValueError("{} must be finite".format(name))
-    return amount
+    return fraction
 
 
 @dataclass(frozen=True)
@@ -42,8 +47,8 @@ class LegalActions:
     check: bool
     call: bool
     fold: bool
-    min_raise_to: Optional[float] = None
-    max_raise_to: Optional[float] = None
+    min_raise_to: Optional[int] = None
+    max_raise_to: Optional[int] = None
 
     def __post_init__(self) -> None:
         for name in ("check", "call", "fold"):
@@ -59,9 +64,9 @@ class LegalActions:
         if minimum is None:
             return
 
-        minimum_value = _finite_amount(minimum, "min_raise_to")
-        maximum_value = _finite_amount(maximum, "max_raise_to")
-        if minimum_value < 0.0 or maximum_value < 0.0:
+        minimum_value = _chip_amount(minimum, "min_raise_to")
+        maximum_value = _chip_amount(maximum, "max_raise_to")
+        if minimum_value < 0 or maximum_value < 0:
             raise ValueError("raise bounds cannot be negative")
         if minimum_value > maximum_value:
             raise ValueError("min_raise_to cannot exceed max_raise_to")
@@ -78,7 +83,7 @@ class CandidateAction:
     """A canonical action considered by the policy."""
 
     kind: str
-    raise_to: Optional[float] = None
+    raise_to: Optional[int] = None
 
     def __post_init__(self) -> None:
         kind = str(self.kind).strip().lower()
@@ -89,8 +94,8 @@ class CandidateAction:
         if kind == "raise":
             if self.raise_to is None:
                 raise ValueError("raise actions require raise_to")
-            amount = _finite_amount(self.raise_to, "raise_to")
-            if amount < 0.0:
+            amount = _chip_amount(self.raise_to, "raise_to")
+            if amount < 0:
                 raise ValueError("raise_to cannot be negative")
             object.__setattr__(self, "raise_to", amount)
         elif self.raise_to is not None:
@@ -101,17 +106,14 @@ class CandidateAction:
         return self.kind == "raise"
 
 
-def _clamp(value: float, minimum: float, maximum: float) -> float:
+def _clamp(value: int, minimum: int, maximum: int) -> int:
     return max(minimum, min(value, maximum))
 
 
-def _deduplicate_amounts(amounts: Sequence[float]) -> Tuple[float, ...]:
-    unique = []
+def _deduplicate_amounts(amounts: Sequence[int]) -> Tuple[int, ...]:
+    unique: list[int] = []
     for amount in amounts:
-        if not any(
-            math.isclose(amount, seen, rel_tol=0.0, abs_tol=_AMOUNT_TOLERANCE)
-            for seen in unique
-        ):
+        if amount not in unique:
             unique.append(amount)
     return tuple(unique)
 
@@ -125,8 +127,8 @@ def generate_candidate_actions(
     The aggressive abstraction always considers min raise, the requested pot
     fractions, and max raise.  Fractional sizes use the pot *after calling*::
 
-        raise_to = hero_street_contribution + to_call
-                   + fraction * (pot + to_call)
+        raise_to = hero_street_contribution + call_cost
+                   + floor(fraction * (pot + call_cost))
 
     Every proposed size is clamped to the inclusive legal range, then duplicate
     sizes are removed while retaining deterministic order.  Returned raise
@@ -147,22 +149,21 @@ def generate_candidate_actions(
             raise ValueError("observation has no legal candidate action")
         return tuple(actions)
 
-    minimum = float(legal.min_raise_to)  # guarded by can_raise
-    maximum = float(legal.max_raise_to)
-    hero_contribution = float(
-        observation.street_contributions[observation.hero_index]
-    )
-    to_call = float(observation.to_call)
-    pot = float(observation.pot)
-    base_after_call = hero_contribution + to_call
-    pot_after_call = pot + to_call
+    minimum = legal.min_raise_to
+    maximum = legal.max_raise_to
+    assert minimum is not None and maximum is not None
+    hero_contribution = observation.street_contributions[observation.hero_index]
+    call_cost = observation.call_cost
+    pot = observation.pot
+    base_after_call = hero_contribution + call_cost
+    pot_after_call = pot + call_cost
 
     raw_sizes = [minimum]
     for fraction in pot_fractions:
-        fraction_value = _finite_amount(fraction, "pot fraction")
+        fraction_value = _finite_fraction(fraction, "pot fraction")
         if fraction_value < 0.0:
             raise ValueError("pot fractions cannot be negative")
-        raw_sizes.append(base_after_call + fraction_value * pot_after_call)
+        raw_sizes.append(base_after_call + math.floor(fraction_value * pot_after_call))
     raw_sizes.append(maximum)
 
     clamped = [_clamp(size, minimum, maximum) for size in raw_sizes]

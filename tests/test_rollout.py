@@ -12,27 +12,29 @@ class EquityStub:
 
 def _observation() -> Observation:
     return Observation(
-        hero_cards=("As", "Qh"),
+        hand_id="rollout:h0",
+        decision_id="rollout:h0:d0",
+        hole_cards=("As", "Qh"),
         board=("2c", "7d", "Jh"),
         street="flop",
         hero_index=0,
         button_index=1,
         actor_index=0,
-        pot=10,
-        to_call=2,
-        stacks=(98, 98),
-        street_contributions=(0, 2),
-        hand_contributions=(2, 4),
-        player_statuses=("active", "active"),
-        action_history=(),
-        legal_actions=LegalActions(False, True, True, 4, 98),
+        pot=1000,
+        call_cost=200,
+        stacks=(9800, 9800),
+        street_contributions=(0, 200),
+        hand_contributions=(200, 400),
+        statuses=("active", "active"),
+        public_history=(),
+        legal_actions=LegalActions(False, True, True, 400, 9800),
     )
 
 
 def test_rollout_is_reproducible_and_finite() -> None:
     observation = _observation()
     action = next(a for a in generate_candidate_actions(observation) if a.kind == "raise")
-    estimator = BaselineRolloutEstimator("calling", simulations=200, seed=17)
+    estimator = BaselineRolloutEstimator("calling", simulations=200, policy_hand_seed=17)
     first = estimator.estimate(observation, action, 0.45)
     second = estimator.estimate(observation, action, 0.45)
     assert first == second
@@ -54,6 +56,6 @@ def test_call_propagates_equity_confidence_interval() -> None:
     result = BaselineRolloutEstimator(simulations=10).estimate(
         observation, action, EquityStub()
     )
-    assert result.expected_value == 0.35 * 12 - 2
-    assert result.ci_low == 0.30 * 12 - 2
-    assert result.ci_high == 0.40 * 12 - 2
+    assert result.expected_value == 0.35 * 1200 - 200
+    assert result.ci_low == 0.30 * 1200 - 200
+    assert result.ci_high == 0.40 * 1200 - 200

@@ -4,18 +4,17 @@ PokerKit owns the rules, betting state, and settlement.  This module keeps
 that omniscient engine state behind an actor-specific :class:`Observation` so
 policies never receive the opponent's cards or the remaining deck.
 
-Public monetary values are big blinds.  PokerKit receives integer chip units
-at a resolution of one hundred units per big blind; this avoids floating-point
-chips while retaining centi-big-blind raise sizes.
+All game and policy monetary values are integer chips.  Reports may convert
+them to big blinds using one hundred chips per big blind.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from decimal import Decimal, ROUND_HALF_UP
-import math
 import random
+import re
 from typing import TypeAlias
+from uuid import uuid4
 
 from pokerkit import (
     Automation,
@@ -26,9 +25,9 @@ from pokerkit import (
     State,
 )
 
-from .actions import CandidateAction, LegalActions
+from .actions import CandidateAction, LegalActions, generate_candidate_actions
 from .cards import CardLike, STANDARD_DECK, card_code, parse_cards
-from .observation import Observation
+from .observation import ActionEvent, BoardEvent, Observation, PreState, PublicEvent
 
 
 UNITS_PER_BB = 100
@@ -61,35 +60,35 @@ def _validate_player_index(player_index: int, *, name: str = "player_index") -> 
     return player_index
 
 
-def _to_bb(amount: int) -> float:
-    return amount / UNITS_PER_BB
+def _starting_stacks(value: Sequence[int]) -> tuple[int, int]:
+    stacks = tuple(value)
+    if len(stacks) != PLAYER_COUNT:
+        raise ValueError("starting_stacks must contain exactly two chip amounts")
+    for index, amount in enumerate(stacks):
+        if isinstance(amount, bool) or not isinstance(amount, int):
+            raise TypeError(f"starting_stacks[{index}] must be an integer chip amount")
+        if amount <= 0:
+            raise ValueError(f"starting_stacks[{index}] must be positive")
+    return stacks  # type: ignore[return-value]
 
 
-def _to_units(amount: float, *, name: str) -> int:
-    """Convert a finite BB amount to the nearest centi-BB chip unit."""
-
-    if isinstance(amount, bool):
-        raise TypeError(f"{name} must be a number, not bool")
-    try:
-        numeric = float(amount)
-    except (TypeError, ValueError) as exc:
-        raise TypeError(f"{name} must be a finite number") from exc
-    if not math.isfinite(numeric):
-        raise ValueError(f"{name} must be finite")
-    if numeric < 0:
-        raise ValueError(f"{name} cannot be negative")
-
-    # Decimal(str(...)) makes the user-facing decimal amount authoritative and
-    # avoids surprises such as int(2.3 * 100) becoming 229.
-    scaled = Decimal(str(numeric)) * UNITS_PER_BB
-    return int(scaled.quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+def _run_identifier(value: str | None) -> str:
+    if value is None:
+        return str(uuid4())
+    if not isinstance(value, str):
+        raise TypeError("run_id must be a string or None")
+    normalized = value.strip()
+    if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", normalized) is None:
+        raise ValueError("run_id may contain only letters, digits, '.', '_', and '-'")
+    return normalized
 
 
 class PokerKitHeadsUpHand:
-    """Play one seeded 100 BB heads-up no-limit Hold'em hand.
+    """Play one seeded heads-up no-limit Hold'em hand.
 
     Seat ``0`` is PokerKit's heads-up big blind and seat ``1`` is the
-    small-blind/button.  A fresh instance always starts both seats at 100 BB.
+    small-blind/button.  The default is 10,000 chips per seat; tests may supply
+    asymmetric positive starting stacks.
 
     Args:
         seed: Seed for the local RNG used to build the explicit deck order.
@@ -97,12 +96,14 @@ class PokerKitHeadsUpHand:
         deck_order: Optional complete 52-card order, with the first item dealt
             first.  It is mainly useful for exact scenario tests and overrides
             the seeded shuffle.
+        starting_stacks: Two seat-specific integer-chip stacks.
+        run_id: Public identifier, or ``None`` to generate a UUIDv4.
+        hand_sequence: Zero-based hand number inside the run.
     """
 
     units_per_bb = UNITS_PER_BB
-    small_blind = SMALL_BLIND_UNITS / UNITS_PER_BB
-    big_blind = BIG_BLIND_UNITS / UNITS_PER_BB
-    starting_stack = STARTING_STACK_UNITS / UNITS_PER_BB
+    small_blind = SMALL_BLIND_UNITS
+    big_blind = BIG_BLIND_UNITS
     button_index = 1
 
     def __init__(
@@ -111,12 +112,27 @@ class PokerKitHeadsUpHand:
         *,
         hero_index: int = 0,
         deck_order: Iterable[CardLike] | None = None,
+        starting_stacks: Sequence[int] = (STARTING_STACK_UNITS, STARTING_STACK_UNITS),
+        run_id: str | None = None,
+        hand_sequence: int = 0,
     ) -> None:
         if isinstance(seed, bool) or not isinstance(seed, int):
-            raise TypeError("seed must be an integer")
+            raise TypeError("seed must be a non-negative integer")
+        if seed < 0:
+            raise ValueError("seed must be a non-negative integer")
+        if isinstance(hand_sequence, bool) or not isinstance(hand_sequence, int):
+            raise TypeError("hand_sequence must be an integer")
+        if hand_sequence < 0:
+            raise ValueError("hand_sequence cannot be negative")
 
         self.seed = seed
         self.hero_index = _validate_player_index(hero_index, name="hero_index")
+        self.run_id = _run_identifier(run_id)
+        self.hand_sequence = hand_sequence
+        self.hand_id = f"{self.run_id}:h{hand_sequence}"
+        self.starting_stack = _starting_stacks(starting_stacks)
+        self._starting_total = sum(self.starting_stack)
+        self._decision_index = 0
         self.game = NoLimitTexasHoldem(
             _NON_CARD_AUTOMATIONS,
             True,  # Uniform-ante trimming; there is no ante in the MVP.
@@ -125,11 +141,8 @@ class PokerKitHeadsUpHand:
             BIG_BLIND_UNITS,
             mode=Mode.TOURNAMENT,
         )
-        self._state = self.game(
-            (STARTING_STACK_UNITS, STARTING_STACK_UNITS),
-            PLAYER_COUNT,
-        )
-        self._history: list[dict[str, object]] = []
+        self._state = self.game(self.starting_stack, PLAYER_COUNT)
+        self._history: list[PublicEvent] = []
 
         if deck_order is None:
             ordered_deck = list(STANDARD_DECK)
@@ -164,24 +177,24 @@ class PokerKitHeadsUpHand:
         return self._state
 
     @property
-    def history(self) -> tuple[dict[str, object], ...]:
-        """Return defensive copies of the public player-action history."""
+    def history(self) -> tuple[PublicEvent, ...]:
+        """Return immutable public action and board events."""
 
-        return tuple(dict(event) for event in self._history)
+        return tuple(self._history)
 
     @property
     def is_complete(self) -> bool:
         return not self._state.status
 
     @property
-    def stacks(self) -> tuple[float, float]:
-        return tuple(_to_bb(amount) for amount in self._state.stacks)  # type: ignore[return-value]
+    def stacks(self) -> tuple[int, int]:
+        return tuple(self._state.stacks)  # type: ignore[return-value]
 
     @property
-    def payoffs(self) -> tuple[float, float]:
-        """Net chip results relative to the two 100 BB starting stacks."""
+    def payoffs(self) -> tuple[int, int]:
+        """Net integer-chip results relative to each seat's starting stack."""
 
-        return tuple(_to_bb(amount) for amount in self._state.payoffs)  # type: ignore[return-value]
+        return tuple(self._state.payoffs)  # type: ignore[return-value]
 
     def _street_name(self) -> str:
         street_index = self._state.street_index
@@ -203,7 +216,23 @@ class PokerKitHeadsUpHand:
             elif self._state.can_deal_hole():
                 self._state.deal_hole()
             elif self._state.can_deal_board():
+                previous_board = tuple(
+                    card_code(card) for card in self._state.get_board_cards(0)
+                )
                 self._state.deal_board()
+                board = tuple(card_code(card) for card in self._state.get_board_cards(0))
+                cards = board[len(previous_board):]
+                board_street = {3: "flop", 4: "turn", 5: "river"}.get(len(board))
+                if board_street is None:  # pragma: no cover - PokerKit invariant
+                    raise RuntimeError("PokerKit dealt an invalid public board size")
+                self._history.append(
+                    BoardEvent(
+                        event_id=f"{self.hand_id}:e{len(self._history)}",
+                        street=board_street,
+                        cards=cards,
+                        board=board,
+                    )
+                )
             else:
                 raise RuntimeError(
                     "PokerKit stopped in an unexpected non-player phase",
@@ -211,7 +240,7 @@ class PokerKitHeadsUpHand:
 
     def _assert_chip_conservation(self) -> None:
         chips_in_play = sum(self._state.stacks) + self._state.total_pot_amount
-        expected = PLAYER_COUNT * STARTING_STACK_UNITS
+        expected = self._starting_total
         if chips_in_play != expected:
             raise RuntimeError(
                 f"chip conservation failed: expected {expected}, got {chips_in_play}",
@@ -231,8 +260,8 @@ class PokerKitHeadsUpHand:
             maximum = self._state.max_completion_betting_or_raising_to_amount
             if minimum is None or maximum is None:  # pragma: no cover - API invariant
                 raise RuntimeError("PokerKit reported a raise without raise bounds")
-            min_raise_to = _to_bb(minimum)
-            max_raise_to = _to_bb(maximum)
+            min_raise_to = minimum
+            max_raise_to = maximum
         else:
             min_raise_to = None
             max_raise_to = None
@@ -262,8 +291,8 @@ class PokerKitHeadsUpHand:
             raise RuntimeError("there is currently no player action pending")
 
         board = tuple(card_code(card) for card in self._state.get_board_cards(0))
-        hero_cards = tuple(card_code(card) for card in self._state.hole_cards[player_index])
-        if len(hero_cards) != 2:  # pragma: no cover - construction invariant
+        hole_cards = tuple(card_code(card) for card in self._state.hole_cards[player_index])
+        if len(hole_cards) != 2:  # pragma: no cover - construction invariant
             raise RuntimeError("the player's two hole cards have not been dealt")
 
         if self._state.statuses[player_index] and self._state.stacks[player_index]:
@@ -274,41 +303,42 @@ class PokerKitHeadsUpHand:
         else:
             to_call_units = 0
 
-        player_statuses = []
+        statuses = []
         for index in range(PLAYER_COUNT):
             if not self._state.statuses[index]:
-                player_statuses.append("folded")
+                statuses.append("folded")
             elif not self._state.stacks[index]:
-                player_statuses.append("all_in")
+                statuses.append("all-in")
             else:
-                player_statuses.append("active")
+                statuses.append("active")
 
         return Observation(
-            hero_cards=hero_cards,  # type: ignore[arg-type]
+            hand_id=self.hand_id,
+            decision_id=f"{self.hand_id}:d{self._decision_index}",
+            hole_cards=hole_cards,  # type: ignore[arg-type]
             board=board,
             street=self._street_name(),
             hero_index=player_index,
             button_index=self.button_index,
             actor_index=actor_index,
-            pot=_to_bb(self._state.total_pot_amount),
-            to_call=_to_bb(to_call_units),
-            stacks=tuple(_to_bb(amount) for amount in self._state.stacks),
-            street_contributions=tuple(_to_bb(amount) for amount in self._state.bets),
+            pot=self._state.total_pot_amount,
+            call_cost=to_call_units,
+            stacks=tuple(self._state.stacks),
+            street_contributions=tuple(self._state.bets),
             hand_contributions=tuple(
-                _to_bb(max(0, -payoff)) for payoff in self._state.payoffs
+                max(0, -payoff) for payoff in self._state.payoffs
             ),
-            player_statuses=tuple(player_statuses),
-            action_history=self.history,
+            statuses=tuple(statuses),
+            public_history=self.history,
             legal_actions=self._legal_actions_for(player_index),
         )
 
     def apply_action(self, action: CandidateAction) -> Observation | None:
         """Validate and apply one current-actor action.
 
-        Raise amounts arrive in BB ``raise_to`` units and are converted to the
-        nearest centi-BB engine unit.  Values outside PokerKit's inclusive
-        range are rejected before any state mutation.  The next actor's
-        observation is returned, or ``None`` after exact engine settlement.
+        Raise amounts are integer-chip ``raise_to`` values.  Values outside
+        PokerKit's inclusive range are rejected before any state mutation.
+        The next actor's observation is returned, or ``None`` after settlement.
         """
 
         if not isinstance(action, CandidateAction):
@@ -320,17 +350,22 @@ class PokerKitHeadsUpHand:
         if actor_index is None:
             raise RuntimeError("there is currently no player action pending")
         street = self._street_name()
-
+        pre_observation = self.observation_for(actor_index)
+        pre_state = PreState(
+            board=pre_observation.board,
+            pot=pre_observation.pot,
+            stacks=pre_observation.stacks,
+            street_contributions=pre_observation.street_contributions,
+            hand_contributions=pre_observation.hand_contributions,
+            call_cost=pre_observation.call_cost,
+            legal_actions=pre_observation.legal_actions,
+            candidate_actions=generate_candidate_actions(pre_observation),
+        )
         if action.kind == "fold":
             if not self._state.can_fold():
                 raise ValueError("fold is not legal in the current state")
-            operation = self._state.fold()
-            record: dict[str, object] = {
-                "sequence": len(self._history),
-                "street": street,
-                "player_index": actor_index,
-                "kind": "fold",
-            }
+            self._state.fold()
+            paid_amount = 0
         elif action.kind in ("check", "call"):
             if not self._state.can_check_or_call():
                 raise ValueError(f"{action.kind} is not legal in the current state")
@@ -342,13 +377,7 @@ class PokerKitHeadsUpHand:
             if action.kind == "call" and call_units == 0:
                 raise ValueError("call is not legal when checking is available")
             operation = self._state.check_or_call()
-            record = {
-                "sequence": len(self._history),
-                "street": street,
-                "player_index": actor_index,
-                "kind": action.kind,
-                "amount": _to_bb(operation.amount),
-            }
+            paid_amount = operation.amount
         elif action.kind == "raise":
             if action.raise_to is None:  # CandidateAction enforces this too.
                 raise ValueError("raise actions require raise_to")
@@ -361,38 +390,40 @@ class PokerKitHeadsUpHand:
             ):
                 raise ValueError("raise is not legal in the current state")
 
-            requested = float(action.raise_to)
-            minimum_bb = _to_bb(minimum)
-            maximum_bb = _to_bb(maximum)
-            if requested < minimum_bb or requested > maximum_bb:
+            requested = action.raise_to
+            if requested < minimum or requested > maximum:
                 raise ValueError(
                     "raise_to must be within the inclusive legal range "
-                    f"[{minimum_bb}, {maximum_bb}] BB",
+                    f"[{minimum}, {maximum}] chips",
                 )
 
-            raise_to_units = _to_units(requested, name="raise_to")
-            # Rounding an in-range decimal at the edge must stay on the engine
-            # range.  This is not used to rescue an out-of-range request.
-            raise_to_units = max(minimum, min(maximum, raise_to_units))
-            if not self._state.can_complete_bet_or_raise_to(raise_to_units):
+            if not self._state.can_complete_bet_or_raise_to(requested):
                 raise ValueError("raise_to is not legal in the current state")
-            operation = self._state.complete_bet_or_raise_to(raise_to_units)
-            record = {
-                "sequence": len(self._history),
-                "street": street,
-                "player_index": actor_index,
-                "kind": "raise",
-                "raise_to": _to_bb(operation.amount),
-            }
+            self._state.complete_bet_or_raise_to(requested)
+            paid_amount = min(
+                pre_state.stacks[actor_index],
+                requested - pre_state.street_contributions[actor_index],
+            )
         else:  # pragma: no cover - CandidateAction rejects other kinds.
             raise ValueError(f"unsupported action kind: {action.kind!r}")
 
-        self._history.append(record)
+        self._history.append(
+            ActionEvent(
+                event_id=f"{self.hand_id}:e{len(self._history)}",
+                actor_index=actor_index,
+                street=street,
+                action=action.kind,
+                paid_amount=paid_amount,
+                raise_to=action.raise_to if action.kind == "raise" else None,
+                pre_state=pre_state,
+            )
+        )
+        self._decision_index += 1
         self._advance_cards_until_decision_or_completion()
         self._assert_chip_conservation()
 
         if self.is_complete:
-            if sum(self._state.stacks) != PLAYER_COUNT * STARTING_STACK_UNITS:
+            if sum(self._state.stacks) != self._starting_total:
                 raise RuntimeError("settlement did not return every chip to a stack")
             if sum(self._state.payoffs) != 0:
                 raise RuntimeError("zero-rake heads-up payoffs are not zero-sum")
@@ -424,8 +455,8 @@ class PokerKitHeadsUpHand:
         policies: PolicyCollection,
         *,
         max_actions: int = 256,
-    ) -> tuple[float, float]:
-        """Run policy callbacks to settlement and return net payoffs in BB.
+    ) -> tuple[int, int]:
+        """Run policy callbacks to settlement and return net payoffs in chips.
 
         A single callable may control both seats; alternatively pass a two-item
         sequence or a mapping keyed by seat index.  Every callback receives

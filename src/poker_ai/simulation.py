@@ -1,21 +1,26 @@
-"""End-to-end practice-hand and baseline-match orchestration."""
+"""End-to-end practice-hand and paired baseline-match orchestration."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from .agent import ResearchPokerAgent
 from .baselines import HeuristicBaseline
 from .cards import card_code
-from .environment import PokerKitHeadsUpHand
-from .evaluate import EvaluationReport, paired_seat_schedule, summarize_paired_payoffs
+from .environment import PokerKitHeadsUpHand, UNITS_PER_BB
+from .evaluate import EvaluationReport, summarize_paired_payoffs
+from .observation import PublicEvent
+from .seeding import derive_seed, validate_master_seed
 
 
 @dataclass(frozen=True)
 class PracticeHandResult:
-    seed: int
+    deck_seed: int
+    run_id: str
+    hand_id: str
     hero_index: int
     button_index: int
     opponent_style: str
@@ -24,7 +29,7 @@ class PracticeHandResult:
     payoffs_bb: tuple[float, float]
     final_stacks_bb: tuple[float, float]
     hero_payoff_bb: float
-    action_history: tuple[dict[str, object], ...]
+    action_history: tuple[PublicEvent, ...]
     decision_records: tuple[dict[str, Any], ...]
     pokerkit_hand_history: str
 
@@ -35,14 +40,18 @@ class PracticeHandResult:
 @dataclass(frozen=True)
 class MatchResult:
     opponent_style: str
-    base_seed: int
+    environment_master_seed: int
+    hero_policy_master_seed: int
+    villain_policy_master_seed: int
     report: EvaluationReport
     hands: tuple[PracticeHandResult, ...]
 
     def as_dict(self, *, include_hands: bool = False) -> dict[str, Any]:
         data: dict[str, Any] = {
             "opponent_style": self.opponent_style,
-            "base_seed": self.base_seed,
+            "environment_master_seed": self.environment_master_seed,
+            "hero_policy_master_seed": self.hero_policy_master_seed,
+            "villain_policy_master_seed": self.villain_policy_master_seed,
             "report": self.report.as_dict(),
         }
         if include_hands:
@@ -50,9 +59,17 @@ class MatchResult:
         return data
 
 
+def _bb(amount: int) -> float:
+    return amount / UNITS_PER_BB
+
+
 def play_practice_hand(
     *,
-    seed: int = 0,
+    environment_master_seed: int = 0,
+    hero_policy_master_seed: int = 1,
+    villain_policy_master_seed: int = 2,
+    hand_sequence: int = 0,
+    run_id: str | None = None,
     hero_index: int = 1,
     opponent_style: str = "balanced",
     equity_simulations: int = 2_000,
@@ -60,12 +77,68 @@ def play_practice_hand(
     baseline_simulations: int = 300,
     risk_aversion: float = 0.0,
     audit_path: str | Path | None = None,
+    _pair_index: int | None = None,
+    _leg_index: int = 0,
 ) -> PracticeHandResult:
-    """Play and exactly settle one reset-stack PokerKit practice hand."""
+    """Play and settle one hand with independent environment/policy seeds."""
 
-    environment = PokerKitHeadsUpHand(seed=seed, hero_index=hero_index)
+    environment_master_seed = validate_master_seed(
+        environment_master_seed, "environment_master_seed"
+    )
+    hero_policy_master_seed = validate_master_seed(
+        hero_policy_master_seed, "hero_policy_master_seed"
+    )
+    villain_policy_master_seed = validate_master_seed(
+        villain_policy_master_seed, "villain_policy_master_seed"
+    )
+    if isinstance(hand_sequence, bool) or not isinstance(hand_sequence, int):
+        raise TypeError("hand_sequence must be an integer")
+    if hand_sequence < 0:
+        raise ValueError("hand_sequence cannot be negative")
+
+    if _pair_index is None:
+        deck_seed = derive_seed(
+            environment_master_seed, "deck", "single", hand_sequence
+        )
+        hero_hand_seed = derive_seed(
+            hero_policy_master_seed,
+            "single",
+            hand_sequence,
+            hero_index,
+            "hero",
+        )
+        villain_hand_seed = derive_seed(
+            villain_policy_master_seed,
+            "single",
+            hand_sequence,
+            1 - hero_index,
+            f"baseline:{opponent_style}",
+        )
+    else:
+        deck_seed = derive_seed(environment_master_seed, "deck", _pair_index)
+        hero_hand_seed = derive_seed(
+            hero_policy_master_seed,
+            _pair_index,
+            _leg_index,
+            hero_index,
+            "hero",
+        )
+        villain_hand_seed = derive_seed(
+            villain_policy_master_seed,
+            _pair_index,
+            _leg_index,
+            1 - hero_index,
+            f"baseline:{opponent_style}",
+        )
+
+    environment = PokerKitHeadsUpHand(
+        seed=deck_seed,
+        hero_index=hero_index,
+        run_id=run_id,
+        hand_sequence=hand_sequence,
+    )
     initial_hero_observation = environment.observation_for(hero_index)
-    hero_cards = initial_hero_observation.hero_cards
+    hero_cards = initial_hero_observation.hole_cards
     model_style = "balanced" if opponent_style == "random" else opponent_style
     decisions: list[dict[str, Any]] = []
 
@@ -73,14 +146,14 @@ def play_practice_hand(
         opponent_style=model_style,
         equity_simulations=equity_simulations,
         rollout_simulations=rollout_simulations,
-        seed=seed * 10_000 + hero_index * 1_000,
+        policy_hand_seed=hero_hand_seed,
         risk_aversion=risk_aversion,
         audit_path=audit_path,
     )
     opponent = HeuristicBaseline(
         opponent_style,
         simulations=baseline_simulations,
-        seed=seed * 10_000 + (1 - hero_index) * 1_000 + 500,
+        policy_hand_seed=villain_hand_seed,
     )
 
     def hero_policy(observation):
@@ -92,10 +165,10 @@ def play_practice_hand(
         action = opponent(observation)
         hero_agent.observe_opponent_action(
             action,
-            hero_cards=hero_cards,
+            hole_cards=hero_cards,
             board=observation.board,
-            facing_bet=observation.to_call > 0.0,
-            event_id=f"{seed}:{len(environment.history)}",
+            facing_bet=observation.call_cost > 0,
+            event_id=f"{environment.hand_id}:e{len(environment.history)}",
         )
         return action
 
@@ -105,20 +178,21 @@ def play_practice_hand(
     finally:
         hero_agent.close()
 
-    final_board = tuple(
-        card_code(card) for card in environment.state.get_board_cards(0)
-    )
-    payoffs = environment.payoffs
+    final_board = tuple(card_code(card) for card in environment.state.get_board_cards(0))
+    payoffs_bb = tuple(_bb(amount) for amount in environment.payoffs)
+    stacks_bb = tuple(_bb(amount) for amount in environment.stacks)
     return PracticeHandResult(
-        seed=seed,
+        deck_seed=deck_seed,
+        run_id=environment.run_id,
+        hand_id=environment.hand_id,
         hero_index=hero_index,
         button_index=environment.button_index,
         opponent_style=opponent_style,
         hero_cards=hero_cards,
         final_board=final_board,
-        payoffs_bb=payoffs,
-        final_stacks_bb=environment.stacks,
-        hero_payoff_bb=payoffs[hero_index],
+        payoffs_bb=payoffs_bb,  # type: ignore[arg-type]
+        final_stacks_bb=stacks_bb,  # type: ignore[arg-type]
+        hero_payoff_bb=payoffs_bb[hero_index],
         action_history=environment.history,
         decision_records=tuple(decisions),
         pokerkit_hand_history=environment.to_hand_history().dumps(),
@@ -128,7 +202,10 @@ def play_practice_hand(
 def evaluate_practice_match(
     *,
     hands: int = 20,
-    base_seed: int = 0,
+    environment_master_seed: int = 0,
+    hero_policy_master_seed: int = 1,
+    villain_policy_master_seed: int = 2,
+    run_id: str | None = None,
     opponent_style: str = "balanced",
     equity_simulations: int = 500,
     rollout_simulations: int = 200,
@@ -136,34 +213,45 @@ def evaluate_practice_match(
     risk_aversion: float = 0.0,
     audit_path: str | Path | None = None,
 ) -> MatchResult:
-    """Evaluate alternating seats with paired deck seeds and a 95% CI."""
+    """Evaluate swapped seats with the same deck in each two-hand pair."""
+
+    if isinstance(hands, bool) or not isinstance(hands, int) or hands <= 0:
+        raise ValueError("hands must be a positive integer")
+    if hands % 2:
+        raise ValueError("paired seat evaluation requires an even number of hands")
+    run_id = str(uuid4()) if run_id is None else run_id
 
     hand_results = []
-    for seed, hero_index in paired_seat_schedule(hands, base_seed):
-        hand_results.append(
-            play_practice_hand(
-                seed=seed,
-                hero_index=hero_index,
-                opponent_style=opponent_style,
-                equity_simulations=equity_simulations,
-                rollout_simulations=rollout_simulations,
-                baseline_simulations=baseline_simulations,
-                risk_aversion=risk_aversion,
-                audit_path=audit_path,
+    for pair_index in range(hands // 2):
+        for leg_index, hero_index in enumerate((0, 1)):
+            hand_sequence = pair_index * 2 + leg_index
+            hand_results.append(
+                play_practice_hand(
+                    environment_master_seed=environment_master_seed,
+                    hero_policy_master_seed=hero_policy_master_seed,
+                    villain_policy_master_seed=villain_policy_master_seed,
+                    hand_sequence=hand_sequence,
+                    run_id=run_id,
+                    hero_index=hero_index,
+                    opponent_style=opponent_style,
+                    equity_simulations=equity_simulations,
+                    rollout_simulations=rollout_simulations,
+                    baseline_simulations=baseline_simulations,
+                    risk_aversion=risk_aversion,
+                    audit_path=audit_path,
+                    _pair_index=pair_index,
+                    _leg_index=leg_index,
+                )
             )
-        )
     report = summarize_paired_payoffs(hand.hero_payoff_bb for hand in hand_results)
     return MatchResult(
         opponent_style=opponent_style,
-        base_seed=base_seed,
+        environment_master_seed=environment_master_seed,
+        hero_policy_master_seed=hero_policy_master_seed,
+        villain_policy_master_seed=villain_policy_master_seed,
         report=report,
         hands=tuple(hand_results),
     )
 
 
-__all__ = [
-    "MatchResult",
-    "PracticeHandResult",
-    "evaluate_practice_match",
-    "play_practice_hand",
-]
+__all__ = ["MatchResult", "PracticeHandResult", "evaluate_practice_match", "play_practice_hand"]

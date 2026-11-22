@@ -6,4 +6,6 @@ PokerKit remains behind the environment adapter and is never exposed to the
 policy as a source of hidden cards.
 """
 
-__version__ = "0.1.0"
+from .versions import PROGRAM_VERSION
+
+__version__ = PROGRAM_VERSION

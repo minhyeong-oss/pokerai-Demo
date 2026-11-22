@@ -14,9 +14,24 @@ from typing import Any, IO, Optional, Union
 
 from .observation import Observation
 from .policy import Decision
+from .versions import AUDIT_SCHEMA_VERSION, PROGRAM_VERSION
 
 
 PathLike = Union[str, Path]
+
+
+def validate_audit_schema(record: Mapping[str, Any]) -> None:
+    """Reject records that claim an unsupported decision-log schema."""
+
+    if not isinstance(record, Mapping):
+        raise TypeError("audit record must be a mapping")
+    if "schema_version" not in record:
+        return
+    version = record["schema_version"]
+    if version != AUDIT_SCHEMA_VERSION:
+        raise ValueError(
+            f"unsupported audit schema {version!r}; expected {AUDIT_SCHEMA_VERSION}"
+        )
 
 
 def to_jsonable(value: Any) -> Any:
@@ -102,7 +117,8 @@ def make_audit_record(
         raise TypeError("metadata must be a mapping")
 
     record = {
-        "schema_version": 1,
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "program_version": PROGRAM_VERSION,
         "timestamp": _timestamp_text(timestamp),
         "model_version": model_version,
         "range_version": range_version,
@@ -144,6 +160,8 @@ class JsonlAuditWriter:
         """Serialize and append one record."""
 
         payload = to_jsonable(record)
+        if isinstance(payload, Mapping):
+            validate_audit_schema(payload)
         line = json.dumps(
             payload,
             ensure_ascii=False,
@@ -202,4 +220,5 @@ __all__ = [
     "append_jsonl",
     "make_audit_record",
     "to_jsonable",
+    "validate_audit_schema",
 ]

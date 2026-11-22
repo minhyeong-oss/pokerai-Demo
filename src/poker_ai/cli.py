@@ -15,6 +15,7 @@ from .equity import monte_carlo_equity
 from .logging import to_jsonable
 from .observation import Observation
 from .simulation import evaluate_practice_match, play_practice_hand
+from .seeding import derive_seed
 from .train import train_kuhn_cfr
 
 
@@ -29,14 +30,17 @@ def _street_from_board(board: Sequence[str]) -> str:
         raise ValueError("board must contain 0, 3, 4, or 5 cards") from exc
 
 
-def _two_player_values(hero_index: int, hero: float, villain: float) -> tuple[float, float]:
+def _two_player_values(hero_index: int, hero: int, villain: int) -> tuple[int, int]:
     return (hero, villain) if hero_index == 0 else (villain, hero)
 
 
 def _add_simulation_options(parser: argparse.ArgumentParser, *, equity_default: int) -> None:
     parser.add_argument("--simulations", type=int, default=equity_default, help="equity samples")
     parser.add_argument("--rollouts", type=int, default=500, help="action rollout samples")
-    parser.add_argument("--seed", type=int, default=0, help="reproducible RNG seed")
+    parser.add_argument(
+        "--hero-policy-master-seed", type=int, default=1,
+        help="hero policy master seed",
+    )
     parser.add_argument(
         "--risk-aversion",
         type=float,
@@ -63,16 +67,16 @@ def build_parser() -> argparse.ArgumentParser:
     advise = subparsers.add_parser("advise", help="compare legal actions for one observation")
     advise.add_argument("--hero", nargs=2, required=True, metavar=("CARD1", "CARD2"))
     advise.add_argument("--board", nargs="*", default=[], metavar="CARD")
-    advise.add_argument("--pot", type=float, required=True)
-    advise.add_argument("--to-call", type=float, required=True)
-    advise.add_argument("--hero-stack", type=float, required=True)
-    advise.add_argument("--villain-stack", type=float, required=True)
-    advise.add_argument("--hero-contribution", type=float, default=0.0)
-    advise.add_argument("--villain-contribution", type=float, default=0.0)
-    advise.add_argument("--hero-hand-contribution", type=float)
-    advise.add_argument("--villain-hand-contribution", type=float)
-    advise.add_argument("--min-raise-to", type=float)
-    advise.add_argument("--max-raise-to", type=float)
+    advise.add_argument("--pot", type=int, required=True, help="pot in chips")
+    advise.add_argument("--call-cost", type=int, required=True, help="call cost in chips")
+    advise.add_argument("--hero-stack", type=int, required=True, help="hero stack in chips")
+    advise.add_argument("--villain-stack", type=int, required=True, help="villain stack in chips")
+    advise.add_argument("--hero-contribution", type=int, default=0)
+    advise.add_argument("--villain-contribution", type=int, default=0)
+    advise.add_argument("--hero-hand-contribution", type=int)
+    advise.add_argument("--villain-hand-contribution", type=int)
+    advise.add_argument("--min-raise-to", type=int)
+    advise.add_argument("--max-raise-to", type=int)
     advise.add_argument("--hero-index", type=int, choices=(0, 1), default=0)
     advise.add_argument("--button-index", type=int, choices=(0, 1), default=1)
     advise.add_argument(
@@ -94,10 +98,14 @@ def build_parser() -> argparse.ArgumentParser:
     play.add_argument("--audit", type=Path, help="append hero decisions to JSONL")
     play.add_argument("--compact", action="store_true", help="omit full decision and PHH payloads")
     _add_simulation_options(play, equity_default=2_000)
+    play.add_argument("--environment-master-seed", type=int, default=0)
+    play.add_argument("--villain-policy-master-seed", type=int, default=2)
 
     evaluate = subparsers.add_parser("evaluate", help="measure bb/100 against a baseline")
     evaluate.add_argument("--hands", type=int, default=20)
-    evaluate.add_argument("--base-seed", type=int, default=0)
+    evaluate.add_argument("--environment-master-seed", type=int, default=0)
+    evaluate.add_argument("--hero-policy-master-seed", type=int, default=1)
+    evaluate.add_argument("--villain-policy-master-seed", type=int, default=2)
     evaluate.add_argument(
         "--opponent",
         choices=("balanced", "tight", "calling", "aggressive", "random"),
@@ -142,14 +150,16 @@ def _run_advise(args: argparse.Namespace) -> int:
         else args.villain_hand_contribution
     )
     observation = Observation(
-        hero_cards=tuple(args.hero),
+        hand_id="cli:h0",
+        decision_id="cli:h0:d0",
+        hole_cards=tuple(args.hero),
         board=tuple(args.board),
         street=_street_from_board(args.board),
         hero_index=hero_index,
         button_index=args.button_index,
         actor_index=hero_index,
         pot=args.pot,
-        to_call=args.to_call,
+        call_cost=args.call_cost,
         stacks=_two_player_values(hero_index, args.hero_stack, args.villain_stack),
         street_contributions=_two_player_values(
             hero_index,
@@ -157,12 +167,12 @@ def _run_advise(args: argparse.Namespace) -> int:
             args.villain_contribution,
         ),
         hand_contributions=_two_player_values(hero_index, hero_hand, villain_hand),
-        player_statuses=("active", "active"),
-        action_history=(),
+        statuses=("active", "active"),
+        public_history=(),
         legal_actions=LegalActions(
-            check=args.to_call == 0.0,
-            call=args.to_call > 0.0,
-            fold=args.to_call > 0.0,
+            check=args.call_cost == 0,
+            call=args.call_cost > 0,
+            fold=args.call_cost > 0,
             min_raise_to=args.min_raise_to,
             max_raise_to=args.max_raise_to,
         ),
@@ -171,7 +181,9 @@ def _run_advise(args: argparse.Namespace) -> int:
         opponent_style=args.opponent,
         equity_simulations=args.simulations,
         rollout_simulations=args.rollouts,
-        seed=args.seed,
+        policy_hand_seed=derive_seed(
+            args.hero_policy_master_seed, "single", 0, hero_index, "hero"
+        ),
         risk_aversion=args.risk_aversion,
         audit_path=args.audit,
     ) as agent:
@@ -182,7 +194,9 @@ def _run_advise(args: argparse.Namespace) -> int:
 
 def _run_play(args: argparse.Namespace) -> int:
     result = play_practice_hand(
-        seed=args.seed,
+        environment_master_seed=args.environment_master_seed,
+        hero_policy_master_seed=args.hero_policy_master_seed,
+        villain_policy_master_seed=args.villain_policy_master_seed,
         hero_index=args.hero_index,
         opponent_style=args.opponent,
         equity_simulations=args.simulations,
@@ -201,7 +215,9 @@ def _run_play(args: argparse.Namespace) -> int:
 def _run_evaluate(args: argparse.Namespace) -> int:
     result = evaluate_practice_match(
         hands=args.hands,
-        base_seed=args.base_seed,
+        environment_master_seed=args.environment_master_seed,
+        hero_policy_master_seed=args.hero_policy_master_seed,
+        villain_policy_master_seed=args.villain_policy_master_seed,
         opponent_style=args.opponent,
         equity_simulations=args.simulations,
         rollout_simulations=args.rollouts,

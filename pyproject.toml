@@ -4,13 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "poker-ai-mvp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Reproducible heads-up no-limit Hold'em research simulator and EV advisor"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "MIT" }
 dependencies = [
   "pokerkit==0.7.7",
+  "scipy==1.17.1",
 ]
 
 [project.optional-dependencies]

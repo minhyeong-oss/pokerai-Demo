@@ -9,6 +9,7 @@ from poker_ai.actions import CandidateAction, generate_candidate_actions
 from poker_ai.cards import STANDARD_DECK, card_code
 from poker_ai.environment import PokerKitHeadsUpHand
 from poker_ai.observation import Observation
+from poker_ai.observation import ActionEvent, BoardEvent
 
 
 def _card_partition(hand: PokerKitHeadsUpHand) -> tuple[str, ...]:
@@ -61,7 +62,7 @@ def test_invalid_explicit_deck_is_rejected() -> None:
 
 
 def test_observations_are_actor_specific_and_do_not_leak_hidden_cards() -> None:
-    hand = PokerKitHeadsUpHand(seed=19, hero_index=0)
+    hand = PokerKitHeadsUpHand(seed=19, hero_index=0, run_id="env-test")
     assert hand.state.actor_index == 1  # Heads-up button/small blind acts first.
 
     actor_observation = hand.observation_for(1)
@@ -71,10 +72,10 @@ def test_observations_are_actor_specific_and_do_not_leak_hidden_cards() -> None:
     assert actor_observation.hero_index == 1
     assert actor_observation.actor_index == 1
     assert actor_observation.button_index == 1
-    assert actor_observation.hero_cards == tuple(
+    assert actor_observation.hole_cards == tuple(
         map(card_code, hand.state.hole_cards[1]),
     )
-    assert not set(opponent_cards) & set(actor_observation.hero_cards)
+    assert not set(opponent_cards) & set(actor_observation.hole_cards)
     assert not hasattr(actor_observation, "opponent_cards")
     assert not hasattr(actor_observation, "deck")
 
@@ -86,46 +87,62 @@ def test_observations_are_actor_specific_and_do_not_leak_hidden_cards() -> None:
     assert not waiting_legal.fold
     assert not waiting_legal.can_raise
 
-    next_observation = hand.apply_action(CandidateAction("raise", 2.0))
+    next_observation = hand.apply_action(CandidateAction("raise", 200))
     assert next_observation is not None
     assert next_observation.hero_index == 0
     assert next_observation.actor_index == 0
-    assert next_observation.hero_cards == opponent_cards
-    assert set(next_observation.action_history[0]) == {
-        "sequence",
-        "street",
-        "player_index",
-        "kind",
-        "raise_to",
-    }
+    assert next_observation.hole_cards == opponent_cards
+    event = next_observation.public_history[0]
+    assert isinstance(event, ActionEvent)
+    assert event.event_id == "env-test:h0:e0"
+    assert event.action == "raise"
+    assert event.raise_to == 200
+    assert event.paid_amount == 150
+    assert event.pre_state.pot == 150
     hidden_cards = set(map(card_code, hand.state.hole_cards[1]))
-    assert not hidden_cards & set(next_observation.hero_cards + next_observation.board)
-    assert all(card not in repr(next_observation.action_history) for card in hidden_cards)
+    assert not hidden_cards & set(next_observation.hole_cards + next_observation.board)
+    assert all(card not in repr(next_observation.public_history) for card in hidden_cards)
 
 
-def test_initial_legal_actions_and_raise_to_conversion_use_bb() -> None:
+def test_initial_legal_actions_and_raise_to_use_integer_chips() -> None:
     hand = PokerKitHeadsUpHand(seed=2)
     observation = hand.observation_for(1)
 
     assert observation.street == "preflop"
-    assert observation.pot == 1.5
-    assert observation.to_call == 0.5
-    assert observation.stacks == (99.0, 99.5)
-    assert observation.street_contributions == (1.0, 0.5)
-    assert observation.hand_contributions == (1.0, 0.5)
+    assert observation.pot == 150
+    assert observation.call_cost == 50
+    assert observation.stacks == (9900, 9950)
+    assert observation.street_contributions == (100, 50)
+    assert observation.hand_contributions == (100, 50)
     assert observation.legal_actions.fold
     assert observation.legal_actions.call
     assert not observation.legal_actions.check
-    assert observation.legal_actions.min_raise_to == 2.0
-    assert observation.legal_actions.max_raise_to == 100.0
+    assert observation.legal_actions.min_raise_to == 200
+    assert observation.legal_actions.max_raise_to == 10_000
 
-    # Half a centi-BB rounds deterministically to the nearest engine chip.
-    next_observation = hand.apply_action(CandidateAction("raise", 2.005))
+    next_observation = hand.apply_action(CandidateAction("raise", 201))
     assert next_observation is not None
     assert hand.state.bets == [100, 201]
-    assert hand.history[-1]["raise_to"] == 2.01
-    assert next_observation.to_call == 1.01
-    assert next_observation.legal_actions.min_raise_to == 3.02
+    assert hand.history[-1].raise_to == 201
+    assert next_observation.call_cost == 101
+    assert next_observation.legal_actions.min_raise_to == 302
+
+
+def test_run_hand_decision_and_event_ids_do_not_embed_seed() -> None:
+    hand = PokerKitHeadsUpHand(
+        seed=987654,
+        run_id="public-run",
+        hand_sequence=4,
+    )
+    first = hand.observation_for(1)
+    assert first.hand_id == "public-run:h4"
+    assert first.decision_id == "public-run:h4:d0"
+    assert "987654" not in first.hand_id
+
+    second = hand.apply_action(CandidateAction("call"))
+    assert second is not None
+    assert second.decision_id == "public-run:h4:d1"
+    assert second.public_history[0].event_id == "public-run:h4:e0"
 
 
 def test_illegal_actions_are_rejected_without_mutating_state() -> None:
@@ -140,9 +157,9 @@ def test_illegal_actions_are_rejected_without_mutating_state() -> None:
     with pytest.raises(ValueError, match="check is not legal"):
         hand.apply_action(CandidateAction("check"))
     with pytest.raises(ValueError, match="inclusive legal range"):
-        hand.apply_action(CandidateAction("raise", 1.99))
+        hand.apply_action(CandidateAction("raise", 199))
     with pytest.raises(ValueError, match="inclusive legal range"):
-        hand.apply_action(CandidateAction("raise", 100.01))
+        hand.apply_action(CandidateAction("raise", 10_001))
 
     after = (
         tuple(hand.state.stacks),
@@ -171,10 +188,11 @@ def test_every_generated_candidate_is_accepted_by_environment() -> None:
 
         hand.apply_action(_passive_action(observation))
 
-    assert len(hand.history) == 8
+    assert len(tuple(event for event in hand.history if isinstance(event, ActionEvent))) == 8
+    assert len(tuple(event for event in hand.history if isinstance(event, BoardEvent))) == 3
     assert len(tuple(hand.state.get_board_cards(0))) == 5
-    assert sum(hand.stacks) == 200.0
-    assert sum(hand.payoffs) == 0.0
+    assert sum(hand.stacks) == 20_000
+    assert sum(hand.payoffs) == 0
 
 
 def test_fold_is_settled_exactly_and_chips_are_conserved() -> None:
@@ -183,38 +201,53 @@ def test_fold_is_settled_exactly_and_chips_are_conserved() -> None:
 
     assert result is None
     assert hand.is_complete
-    assert hand.stacks == (100.5, 99.5)
-    assert hand.payoffs == (0.5, -0.5)
+    assert hand.stacks == (10_050, 9_950)
+    assert hand.payoffs == (50, -50)
     assert hand.state.total_pot_amount == 0
     assert sum(hand.state.stacks) == 20_000
-    assert hand.history == (
-        {
-            "sequence": 0,
-            "street": "preflop",
-            "player_index": 1,
-            "kind": "fold",
-        },
-    )
+    assert len(hand.history) == 1
+    assert hand.history[0].action == "fold"
+    assert hand.history[0].paid_amount == 0
 
 
 def test_all_in_runs_out_board_and_engine_settles_the_whole_pot() -> None:
     hand = PokerKitHeadsUpHand(seed=11)
-    hand.apply_action(CandidateAction("raise", 100.0))
+    hand.apply_action(CandidateAction("raise", 10_000))
     result = hand.apply_action(CandidateAction("call"))
 
     assert result is None
     assert hand.is_complete
     assert len(tuple(hand.state.get_board_cards(0))) == 5
     assert hand.state.total_pot_amount == 0
-    assert sum(hand.stacks) == 200.0
-    assert hand.payoffs == tuple(stack - 100.0 for stack in hand.stacks)
-    assert sum(hand.payoffs) == 0.0
+    assert sum(hand.stacks) == 20_000
+    assert hand.payoffs == tuple(stack - 10_000 for stack in hand.stacks)
+    assert sum(hand.payoffs) == 0
     assert len(_card_partition(hand)) == 52
     assert len(set(_card_partition(hand))) == 52
 
     operation_names = {type(operation).__name__ for operation in hand.state.operations}
     assert "ChipsPushing" in operation_names
     assert "ChipsPulling" in operation_names
+
+
+def test_asymmetric_starting_stacks_settle_and_conserve_exact_total() -> None:
+    hand = PokerKitHeadsUpHand(
+        seed=12,
+        starting_stacks=(4_000, 10_000),
+        run_id="short-stack",
+    )
+    assert hand.starting_stack == (4_000, 10_000)
+    assert sum(hand.state.stacks) + hand.state.total_pot_amount == 14_000
+
+    hand.apply_action(CandidateAction("raise", 10_000))
+    hand.apply_action(CandidateAction("call"))
+
+    assert hand.is_complete
+    assert sum(hand.stacks) == 14_000
+    assert hand.payoffs == tuple(
+        stack - starting
+        for stack, starting in zip(hand.stacks, (4_000, 10_000))
+    )
 
 
 def test_run_passes_only_observations_and_phh_replays_final_stacks() -> None:

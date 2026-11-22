@@ -61,25 +61,25 @@ python3.11 -m venv .venv
 
 ### 2. 한 의사결정 비교
 
-금액은 모두 BB이고 레이즈는 추가 금액이 아닌 **현재 스트리트의 총
-`raise_to`**입니다.
+입력 금액은 모두 정수 칩이며 `100칩 = 1BB`입니다. 레이즈는 추가 금액이
+아닌 **현재 스트리트의 총 `raise_to`**입니다.
 
 ```bash
 .venv/bin/poker-ai advise \
   --hero As Qs \
   --board Jh 7d 2c \
-  --pot 30 \
-  --to-call 10 \
-  --hero-stack 90 \
-  --villain-stack 80 \
+  --pot 3000 \
+  --call-cost 1000 \
+  --hero-stack 9000 \
+  --villain-stack 8000 \
   --hero-contribution 0 \
-  --villain-contribution 10 \
-  --min-raise-to 20 \
-  --max-raise-to 90 \
+  --villain-contribution 1000 \
+  --min-raise-to 2000 \
+  --max-raise-to 9000 \
   --opponent calling \
   --simulations 10000 \
   --rollouts 2000 \
-  --seed 42 \
+  --hero-policy-master-seed 42 \
   --audit decisions.jsonl
 ```
 
@@ -92,7 +92,9 @@ python3.11 -m venv .venv
 .venv/bin/poker-ai play \
   --hero-index 1 \
   --opponent aggressive \
-  --seed 17 \
+  --environment-master-seed 17 \
+  --hero-policy-master-seed 18 \
+  --villain-policy-master-seed 19 \
   --simulations 2000 \
   --audit hand-decisions.jsonl
 ```
@@ -106,10 +108,13 @@ python3.11 -m venv .venv
 .venv/bin/poker-ai evaluate \
   --hands 100 \
   --opponent calling \
-  --base-seed 1000 \
+  --environment-master-seed 1000 \
+  --hero-policy-master-seed 2000 \
+  --villain-policy-master-seed 3000 \
   --simulations 1000
 ```
 
+환경·hero 정책·villain 정책 난수는 서로 다른 마스터 시드에서 파생합니다.
 같은 덱 시드를 두 좌석에 번갈아 배정하고, 평균 핸드 수익과 bb/100에 95%
 신뢰구간을 붙입니다. 적은 핸드의 bb/100은 변동성이 매우 크므로 성능 결론을
 내리기보다 파이프라인 점검용으로 사용해야 합니다.

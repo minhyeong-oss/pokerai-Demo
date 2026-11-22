@@ -18,6 +18,8 @@ from .opponents import get_style, make_range_profile
 from .policy import Decision, choose_action
 from .ranges import HandRange, UniformRange, bayes_update
 from .rollout import BaselineRolloutEstimator
+from .seeding import derive_analysis_seed, validate_master_seed
+from .versions import POLICY_MODEL_VERSION
 
 
 @dataclass(frozen=True)
@@ -38,10 +40,10 @@ class ResearchPokerAgent:
     opponent_style: str = "balanced"
     equity_simulations: int = 10_000
     rollout_simulations: int = 2_000
-    seed: int = 0
+    policy_hand_seed: int = 0
     risk_aversion: float = 0.0
     audit_path: str | Path | None = None
-    model_version: str = "baseline-ev-v1"
+    model_version: str = POLICY_MODEL_VERSION
     opponent_range: HandRange = field(init=False, repr=False)
     _decision_index: int = field(init=False, default=0, repr=False)
     _range_revision: int = field(init=False, default=0, repr=False)
@@ -59,8 +61,7 @@ class ResearchPokerAgent:
             raise TypeError("simulation counts must be integers")
         if self.equity_simulations <= 0 or self.rollout_simulations <= 1:
             raise ValueError("simulation counts must be positive (rollouts greater than one)")
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
-            raise TypeError("seed must be an integer")
+        validate_master_seed(self.policy_hand_seed, "policy_hand_seed")
         if (
             isinstance(self.risk_aversion, bool)
             or not isinstance(self.risk_aversion, (int, float))
@@ -80,6 +81,7 @@ class ResearchPokerAgent:
         self.opponent_range = UniformRange()
         self._range_revision = 0
         self._processed_event_ids.clear()
+        self._decision_index = 0
         self._range_digest = hashlib.sha256(
             f"range-v1:{self.opponent_style}".encode("utf-8")
         ).hexdigest()[:16]
@@ -92,7 +94,7 @@ class ResearchPokerAgent:
         self,
         action: CandidateAction,
         *,
-        hero_cards: tuple[str, str],
+        hole_cards: tuple[str, str],
         board: tuple[str, ...],
         facing_bet: bool,
         event_id: str | int | None = None,
@@ -108,7 +110,7 @@ class ResearchPokerAgent:
             "event_id": None if event_id is None else str(event_id),
             "kind": action.kind,
             "raise_to": action.raise_to,
-            "hero_cards": hero_cards,
+            "hole_cards": hole_cards,
             "board": board,
             "facing_bet": facing_bet,
         }
@@ -135,7 +137,7 @@ class ResearchPokerAgent:
             self.opponent_range,
             action_name,
             profile,
-            dead_cards=(*hero_cards, *board),
+            dead_cards=(*hole_cards, *board),
         )
         self._range_revision += 1
         self._range_digest = hashlib.sha256(
@@ -153,26 +155,37 @@ class ResearchPokerAgent:
             raise ValueError("the agent may decide only when hero_index is the current actor")
         active_opponents = [
             index
-            for index, status in enumerate(observation.player_statuses)
-            if index != observation.hero_index and status not in ("folded", "out")
+            for index, status in enumerate(observation.statuses)
+            if index != observation.hero_index and status != "folded"
         ]
         if len(observation.stacks) != 2 or len(active_opponents) != 1:
             raise ValueError("ResearchPokerAgent currently supports heads-up observations only")
 
         started = perf_counter()
-        decision_seed = self.seed + self._decision_index * 2
+        try:
+            decision_index = int(observation.decision_id.rsplit(":d", 1)[1])
+        except (IndexError, ValueError) as exc:  # Observation normally guarantees this.
+            raise ValueError("observation has an invalid decision_id") from exc
+        equity_seed = derive_analysis_seed(
+            self.policy_hand_seed,
+            purpose="equity",
+            decision_index=decision_index,
+            candidate_id="none",
+            sample_index=0,
+        )
         equity = monte_carlo_equity(
-            observation.hero_cards,
+            observation.hole_cards,
             observation.board,
             opponents=1,
             simulations=self.equity_simulations,
-            seed=decision_seed,
+            seed=equity_seed,
             opponent_range=self.opponent_range,
         )
         rollout = BaselineRolloutEstimator(
             opponent_style=self.opponent_style,
             simulations=self.rollout_simulations,
-            seed=decision_seed + 1,
+            policy_hand_seed=self.policy_hand_seed,
+            decision_index=decision_index,
             opponent_range=self.opponent_range,
         )
         decision = choose_action(
@@ -190,10 +203,10 @@ class ResearchPokerAgent:
             calculation_ms=elapsed_ms,
             metadata={
                 "equity": equity.as_dict(),
-                "equity_seed": decision_seed,
-                "rollout_seed": decision_seed + 1,
+                "equity_seed": equity_seed,
+                "policy_hand_seed": self.policy_hand_seed,
                 "opponent_style": self.opponent_style,
-                "decision_index": self._decision_index,
+                "decision_index": decision_index,
                 "equity_simulations": self.equity_simulations,
                 "rollout_simulations": self.rollout_simulations,
                 "risk_aversion": self.risk_aversion,

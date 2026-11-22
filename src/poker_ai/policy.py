@@ -405,10 +405,10 @@ def _showdown_proxy(
         low = equity_low * pot
         high = equity_high * pot
     elif action.kind == "call":
-        final_pot = pot + observation.to_call
-        expected = equity * final_pot - observation.to_call
-        low = equity_low * final_pot - observation.to_call
-        high = equity_high * final_pot - observation.to_call
+        final_pot = pot + observation.call_cost
+        expected = equity * final_pot - observation.call_cost
+        low = equity_low * final_pot - observation.call_cost
+        high = equity_high * final_pot - observation.call_cost
     else:
         assert action.kind == "raise" and action.raise_to is not None
         hero_street = observation.street_contributions[observation.hero_index]
@@ -419,8 +419,8 @@ def _showdown_proxy(
 
         opponents = [
             index
-            for index, status in enumerate(observation.player_statuses)
-            if index != observation.hero_index and status not in ("folded", "out")
+            for index, status in enumerate(observation.statuses)
+            if index != observation.hero_index and status != "folded"
         ]
         if len(opponents) != 1:
             raise ValueError(
@@ -477,7 +477,7 @@ def _tie_break_key(evaluation: ActionEvaluation, observation: Observation) -> tu
     priority = {"check": 4, "fold": 3, "call": 2, "raise": 1}
     incremental_cost = 0.0
     if evaluation.action.kind == "call":
-        incremental_cost = observation.to_call
+        incremental_cost = observation.call_cost
     elif evaluation.action.kind == "raise":
         incremental_cost = max(
             0.0,

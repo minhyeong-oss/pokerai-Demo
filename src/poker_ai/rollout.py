@@ -8,8 +8,6 @@ small baseline that can later be replaced by a full PokerKit tree rollout.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import math
 import random
 from dataclasses import dataclass
@@ -20,6 +18,7 @@ from .observation import Observation
 from .opponents import estimate_fold_probability, get_style, range_fold_probability
 from .policy import RolloutEstimate
 from .ranges import HandRange
+from .seeding import action_candidate_id, derive_analysis_seed, validate_master_seed
 
 
 def _equity_view(result: object) -> tuple[float, float, float]:
@@ -34,31 +33,14 @@ def _equity_view(result: object) -> tuple[float, float, float]:
     return value, low, high
 
 
-def _stable_action_seed(base_seed: int, observation: Observation, action: CandidateAction) -> int:
-    payload = {
-        "base_seed": base_seed,
-        "hero_cards": observation.hero_cards,
-        "board": observation.board,
-        "street": observation.street,
-        "pot": observation.pot,
-        "to_call": observation.to_call,
-        "contributions": observation.street_contributions,
-        "action": action.kind,
-        "raise_to": action.raise_to,
-    }
-    digest = hashlib.sha256(
-        json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
-    ).digest()
-    return int.from_bytes(digest[:8], "big")
-
-
 @dataclass(frozen=True)
 class BaselineRolloutEstimator:
     """Sample fold/call and showdown branches for heads-up action comparison."""
 
     opponent_style: str = "balanced"
     simulations: int = 2_000
-    seed: int = 0
+    policy_hand_seed: int = 0
+    decision_index: int = 0
     opponent_range: HandRange | None = None
 
     def __post_init__(self) -> None:
@@ -66,8 +48,11 @@ class BaselineRolloutEstimator:
             raise TypeError("simulations must be an integer")
         if self.simulations <= 1:
             raise ValueError("simulations must be greater than one")
-        if isinstance(self.seed, bool) or not isinstance(self.seed, int):
-            raise TypeError("seed must be an integer")
+        validate_master_seed(self.policy_hand_seed, "policy_hand_seed")
+        if isinstance(self.decision_index, bool) or not isinstance(self.decision_index, int):
+            raise TypeError("decision_index must be an integer")
+        if self.decision_index < 0:
+            raise ValueError("decision_index cannot be negative")
         get_style(self.opponent_style)
         if self.opponent_range is not None and not isinstance(self.opponent_range, HandRange):
             raise TypeError("opponent_range must be a HandRange or None")
@@ -82,8 +67,8 @@ class BaselineRolloutEstimator:
         hero_index = observation.hero_index
         opponent_indices = [
             index
-            for index, status in enumerate(observation.player_statuses)
-            if index != hero_index and status not in ("folded", "out")
+            for index, status in enumerate(observation.statuses)
+            if index != hero_index and status != "folded"
         ]
         if len(opponent_indices) != 1:
             raise ValueError("BaselineRolloutEstimator currently supports heads-up play only")
@@ -101,7 +86,7 @@ class BaselineRolloutEstimator:
                 samples=getattr(equity_result, "simulations", None),
             )
         elif action.kind == "call":
-            cost = observation.to_call
+            cost = observation.call_cost
             final_pot = pot + cost
             return RolloutEstimate(
                 expected_value=equity * final_pot - cost,
@@ -143,13 +128,21 @@ class BaselineRolloutEstimator:
                 fold_probability = range_fold_probability(
                     self.opponent_range,
                     self.opponent_style,
-                    hero_cards=observation.hero_cards,
+                    hero_cards=observation.hole_cards,
                     board_cards=observation.board,
                     raise_cost=opponent_cost,
                     pot=pot,
                 )
             called_ev = equity * called_pot - effective_hero_cost
-            rng = random.Random(_stable_action_seed(self.seed, observation, action))
+            rng = random.Random(
+                derive_analysis_seed(
+                    self.policy_hand_seed,
+                    purpose="rollout_response",
+                    decision_index=self.decision_index,
+                    candidate_id=action_candidate_id(action),
+                    sample_index=0,
+                )
+            )
             outcomes: list[float] = []
             called_count = 0
             for _ in range(self.simulations):

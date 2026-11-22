@@ -16,17 +16,17 @@ def test_advise_command_logs_chosen_action(capsys) -> None:
     code = main([
         "advise",
         "--hero", "As", "Qs",
-        "--pot", "3",
-        "--to-call", "1",
-        "--hero-stack", "99",
-        "--villain-stack", "98",
-        "--hero-contribution", "1",
-        "--villain-contribution", "2",
-        "--min-raise-to", "4",
-        "--max-raise-to", "100",
+        "--pot", "300",
+        "--call-cost", "100",
+        "--hero-stack", "9900",
+        "--villain-stack", "9800",
+        "--hero-contribution", "100",
+        "--villain-contribution", "200",
+        "--min-raise-to", "400",
+        "--max-raise-to", "10000",
         "--simulations", "20",
         "--rollouts", "10",
-        "--seed", "9",
+        "--hero-policy-master-seed", "9",
     ])
     assert code == 0
     payload = json.loads(capsys.readouterr().out)
@@ -35,7 +35,7 @@ def test_advise_command_logs_chosen_action(capsys) -> None:
 
 def test_play_compact_command(capsys) -> None:
     code = main([
-        "play", "--seed", "2", "--simulations", "20", "--rollouts", "10",
+        "play", "--environment-master-seed", "2", "--simulations", "20", "--rollouts", "10",
         "--baseline-simulations", "10", "--compact",
     ])
     assert code == 0
